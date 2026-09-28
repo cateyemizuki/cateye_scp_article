@@ -2,3 +2,7 @@
 config.toml
 *.pyc
 __pycache__/
+
+# 流程文档（Agent 专用，永不入库）
+UPLOAD_AGENT.md
+ISSUE_SUBMISSION.md
