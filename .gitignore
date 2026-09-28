@@ -3,6 +3,14 @@ config.toml
 *.pyc
 __pycache__/
 
+# 插件数据目录（运行期缓存：catalog.json / header_assets_*.json）
+data/
+
+# 测试代码（冒烟 / 离线自测）与审查探针：不随插件上传，文档也不引用
+test_*.py
+_tmp_*.py
+_tmpdata/
+
 # 流程文档（Agent 专用，永不入库）
 UPLOAD_AGENT.md
 ISSUE_SUBMISSION.md

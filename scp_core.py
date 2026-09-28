@@ -20,6 +20,7 @@ import base64
 import html
 import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import urlparse
 
 # ==================== 常量 ====================
 
@@ -27,9 +28,42 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 # 0.2.0 起指令按分部路由：/scp → 国际站；/scp cn → 中站。
 INT_SITE = "https://scp-wiki.wikidot.com"
 CN_SITE = "https://scp-wiki-cn.wikidot.com"
+
+# 站点白名单（SSRF 加固）：fetch.site_url_int / site_url_cn 是自由文本配置，
+# 谁能改 WebUI 配置，谁就能把它指向内网地址并让插件把响应回显进群聊。
+# 仅放行 https + 官方两个 wikidot 域名（validate_site_url）。
+ALLOWED_SITE_HOSTS = {"scp-wiki.wikidot.com", "scp-wiki-cn.wikidot.com"}
 # 兼容旧引用
 DEFAULT_SITE = INT_SITE
 EN_SITE = INT_SITE
+
+
+def validate_site_url(url: str) -> Tuple[bool, str]:
+    """校验站点根地址是否在白名单内（SSRF 加固）。
+
+    仅放行 https + ALLOWED_SITE_HOSTS 中的官方 wikidot 域名，用于约束
+    fetch.site_url_int / fetch.site_url_cn 两个自由文本配置：配置指向
+    http://127.0.0.1、内网地址（RFC1918 / link-local）或非 http(s) scheme
+    时一律拒绝，避免把内部服务响应回显进群聊。
+
+    Args:
+        url: 待校验的站点根地址。
+
+    Returns:
+        (是否放行, 拒绝原因)。放行时原因为空串。
+    """
+    raw = str(url or "").strip()
+    if not raw:
+        return False, "站点地址为空"
+    parsed = urlparse(raw)
+    if parsed.scheme.lower() != "https":
+        return False, f"仅允许 https 站点（当前 scheme：{parsed.scheme or '无'}）"
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False, "站点地址缺少域名"
+    if host not in ALLOWED_SITE_HOSTS:
+        return False, f"域名 {host} 不在允许的站点白名单内"
+    return True, ""
 
 # 各分部官方页头资源（来自两站 Sigma-9 主题 CSS 中的 #header / #container-wrap 定义，
 # 2026-09-26 实测抓取验证）。「官方页面渲染头」即各站页头使用的 logo 与横幅底纹。
@@ -88,8 +122,32 @@ _CATALOG_ITEM_RE = re.compile(
     r'\s*(?:[-\u2013\u2014]\s*([^<]*?))?\s*</li>',
     re.I,
 )
-# 编号合法性：SCP-173 / SCP-CN-173 / SCP-EN-173 等
-_CODE_RE = re.compile(r"^SCP(?:-[A-Z]{2,3})?-\d+$", re.I)
+# 编号合法性：SCP-173 / SCP-CN-173 / SCP-EN-173 等。
+# re.ASCII 是刻意的：\d 默认匹配 Unicode 数字（全角「１７３」、阿拉伯-印度数字），
+# 不限定会与「slug 必须为 ASCII」的约束脱节（目录里出现 code=SCP-１７３ 而 slug=scp-173）。
+_CODE_RE = re.compile(r"^SCP(?:-[A-Z]{2,3})?-\d+$", re.I | re.ASCII)
+
+# slug 安全形态（ASCII 严格）：小写字母数字与连字符，可含分段，长度受限。
+# 用于两处把关：① 目录解析拒绝畸形 href；② 请求前最终校验，保证拼进
+# f"{site}/{slug}" 的 slug 不含 %（百分号编码，%2e%2e 可被服务端解回上级目录）、
+# 斜杠、反斜杠、空白、查询/锚点、非 ASCII 数字或超长路径。
+_SAFE_SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+MAX_SLUG_LEN = 128
+
+
+def is_safe_slug(slug: str) -> bool:
+    """判断 slug 是否可安全拼进 URL 路径（ASCII 严格白名单 + 长度上限）。
+
+    Args:
+        slug: 待校验的 slug（如 `scp-173`、`scp-cn-2000`）。
+
+    Returns:
+        True 表示可安全用于 `f"{site}/{slug}"`。
+    """
+    s = str(slug or "").strip()
+    if not s or len(s) > MAX_SLUG_LEN:
+        return False
+    return bool(_SAFE_SLUG_RE.match(s))
 
 # 常见 HTML 实体（未以标准库覆盖的补充映射）
 _EXTRA_ENTITIES: Dict[str, str] = {
@@ -210,6 +268,9 @@ def normalize_code(raw: str) -> str:
     支持的输入：`scp-173`、`SCP-173`、`173`、`scpcn2000`、`SCP-CN-2000`、
     `cn-2000`、`cn2000`。无法识别时返回空串。
 
+    数字一律按 **ASCII** 匹配（`re.ASCII`）：全角「１７３」、阿拉伯-印度数字等
+    Unicode 数字不再被当成合法编号，最终还会经 `is_safe_slug` 把关。
+
     Args:
         raw: 用户原始输入。
 
@@ -222,19 +283,22 @@ def normalize_code(raw: str) -> str:
     # 去掉全角字符、空格、下划线
     s = s.replace("　", "").replace(" ", "").replace("_", "-")
     s = re.sub(r"-{2,}", "-", s).strip("-")
+    out = ""
     # 已含 scp 前缀：scp-173 / scpcn173 / scp-cn-173
-    m = re.match(r"^scp-?([a-z]{2,3})?-?(\d+)$", s)
+    m = re.match(r"^scp-?([a-z]{2,3})?-?(\d+)$", s, re.ASCII)
     if m:
         branch, num = m.group(1), m.group(2)
-        return f"scp-{branch}-{num}" if branch else f"scp-{num}"
+        out = f"scp-{branch}-{num}" if branch else f"scp-{num}"
     # 纯数字：173
-    if re.match(r"^\d+$", s):
-        return f"scp-{s}"
-    # 分部前缀无 scp：cn-2000 / cn2000 / en-173
-    m = re.match(r"^([a-z]{2,3})-?(\d+)$", s)
-    if m:
-        return f"scp-{m.group(1)}-{m.group(2)}"
-    return ""
+    elif re.match(r"^\d+$", s, re.ASCII):
+        out = f"scp-{s}"
+    else:
+        # 分部前缀无 scp：cn-2000 / cn2000 / en-173
+        m = re.match(r"^([a-z]{2,3})-?(\d+)$", s, re.ASCII)
+        if m:
+            out = f"scp-{m.group(1)}-{m.group(2)}"
+    # 最终把关：拼 URL 前保证 slug 为安全的 ASCII 形态（拒绝 %、/、超长等）
+    return out if is_safe_slug(out) else ""
 
 
 def slug_branch(slug: str) -> str:
@@ -673,13 +737,24 @@ def parse_catalog_items(html_text: str) -> List[Dict[str, str]]:
     body = m.group(1) if m else html_text
     out: List[Dict[str, str]] = []
     for href, label, title in _CATALOG_ITEM_RE.findall(body):
+        # 目录/SSRF 加固：只收同源相对路径。拒绝绝对 URL、协议相对（//）、上级目录
+        # （..）、带 scheme（:）或查询/锚点的 href——随机抽取时会拿 slug 直接拼 URL，
+        # 畸形路径不得进入目录。
+        if (not href or href.startswith(("/", ".", "http", "www"))
+                or any(c in href for c in (":", "..", "?", "#", "\\", "//"))):
+            continue
+        slug = href.strip().lower()
+        # 最终形态校验（ASCII 严格 + 长度上限）：拦下百分号编码（%2e%2e 可被服务端
+        # 解回上级目录）、尾随斜杠、空段、非 ASCII 数字、超长路径等漏网形态。
+        if not is_safe_slug(slug):
+            continue
         label = re.sub(r"\s+", " ", label).strip()
         if not _CODE_RE.match(label):
             continue
         title = re.sub(r"\s+", " ", title or "").strip()
         code = label.upper()
         out.append({
-            "slug": href.strip().lower(),
+            "slug": slug,
             "code": code,
             "title": title,
             "branch": "CN" if "-CN-" in code else "INT",
@@ -891,6 +966,10 @@ __all__ = [
     "slug_branch",
     "force_branch_slug",
     "to_data_uri",
+    "validate_site_url",
+    "ALLOWED_SITE_HOSTS",
+    "is_safe_slug",
+    "MAX_SLUG_LEN",
     "crop_png_rows",
     "crop_svg_top",
     "crop_banner_tile",

@@ -5,8 +5,9 @@
   指令 `/scp cn <编号|关键字>`：查询**中站**（scp-wiki-cn.wikidot.com）条目。
   编号本身带 cn 标记（如 `/scp cn-2000`）时自动路由到中站。
 - 文章默认**渲染为图片**发送：抓取对应分部**官方页头资源**（Sigma-9 主题的
-  logo 与横幅底纹）内嵌 HTML，经宿主 `render.html2png` 渲染成图后用
-  `send.image` 发出，还原官方页面观感；渲染/发送失败自动回退**合并转发文本**。
+  logo 与横幅底纹；抓不到时依次用本机旧缓存、随插件发布的内置兜底资源）内嵌 HTML，
+  经宿主 `render.html2png` 渲染成图后用 `send.image` 发出，还原官方页面观感；
+  渲染/发送失败自动回退**合并转发文本**。
 - 指令 `/scp <编号> <页号>`：读取超长条目的后续分页（图片按页编号）。
 - 指令 `/scp rand` / `/scp cn rand`：从对应分部的本地目录随机抽一篇。
 - 本地维护 SCP 条目目录（编号 + 标题，约 1.1 万条），支持关键字搜索与随机，
@@ -40,6 +41,7 @@ import os
 import random
 import re
 import time
+from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Optional, Sequence, Tuple
 
 import httpx
@@ -63,19 +65,20 @@ try:
         extract_page_content,
         force_branch_slug,
         is_error_page,
+        is_safe_slug,
         merge_catalog,
         normalize_code,
         parse_catalog_items,
         search_catalog,
         slug_branch,
         to_data_uri,
+        validate_site_url,
     )
 except ImportError:  # pragma: no cover - Runner 以独立模块加载 plugin.py 时走绝对导入
     # 兜底：把插件目录加入 sys.path，确保能导入同目录的 scp_core
     import sys as _sys
-    from pathlib import Path as _Path
 
-    _PLUGIN_DIR = _Path(__file__).resolve().parent
+    _PLUGIN_DIR = Path(__file__).resolve().parent
     if str(_PLUGIN_DIR) not in _sys.path:
         _sys.path.insert(0, str(_PLUGIN_DIR))
     from scp_core import (  # type: ignore[no-redef]
@@ -93,12 +96,14 @@ except ImportError:  # pragma: no cover - Runner 以独立模块加载 plugin.py
         extract_page_content,
         force_branch_slug,
         is_error_page,
+        is_safe_slug,
         merge_catalog,
         normalize_code,
         parse_catalog_items,
         search_catalog,
         slug_branch,
         to_data_uri,
+        validate_site_url,
     )
 
 # ==================== 常量 ====================
@@ -108,7 +113,12 @@ except ImportError:  # pragma: no cover - Runner 以独立模块加载 plugin.py
 # 图片渲染显式传 device_scale_factor（render.render_scale）并加发送体积护栏。
 # 0.2.3：渲染字号放大（render.font_scale 默认 1.5）；图片统一合并转发（单图也入卡）。
 # 0.2.4：修复合并转发假阴性超时下的回退抢跑/内容重复；渲染缩放默认 1.0（字段更名 render_scale）。
-SUPPORTED_CONFIG_VERSION = "0.2.4"
+# 0.3.0：站点配置白名单校验（SSRF 加固）；/scp刷新目录 per-stream 冷却；
+# 抓取响应体大小上限（流式读取）；目录 slug 过滤畸形路径。
+# 0.3.1：slug 严格形态校验（ASCII 白名单 + 长度上限，拦下百分号编码 / 尾随斜杠 /
+# 非 ASCII 数字等漏网形态），并在请求前与随机抽取处做纵深防御；
+# 新增内置兜底页头资源（assets/header_<BRANCH>.json，随插件发布）。
+SUPPORTED_CONFIG_VERSION = "0.3.1"
 
 # 默认发送方式：image（渲染为图片）；可配置为 text（合并转发文本）
 DEFAULT_SEND_MODE = "image"
@@ -165,8 +175,24 @@ DEFAULT_CATALOG_CACHE_HOURS = 168
 # 官方页头资源缓存有效期（小时；资源基本不变，7 天足够）
 DEFAULT_HEADER_CACHE_HOURS = 168
 
+# 内置兜底页头资源（随插件发布的 assets/header_<BRANCH>.json）：
+# 内容为「开发期抓到的官方页头」——logo 与已裁剪暗色页头带的 body_bg 的 data URI，
+# 由 tools/build_header_assets.py 生成。运行时下载失败、且本机也没有任何（哪怕过期的）
+# 磁盘缓存时用它出图，避免退化成纯色横幅 + 文字徽标。
+BUNDLED_ASSET_DIR = "assets"
+BUNDLED_ASSET_SCHEMA = 1
+
 # HTTP 超时（秒）
 HTTP_TIMEOUT = 20.0
+
+# 抓取响应体大小上限（字节）：正文 HTML 5MB / 官方页头资源 4MB。
+# 流式读取并在超限时中止，防御官方 CDN 改版或被污染时超大响应吃满进程内存。
+MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+MAX_ASSET_BYTES = 4 * 1024 * 1024
+
+# /scp刷新目录 冷却（秒，per-stream）：一次刷新要抓 15 个索引页、约 20 秒，
+# 无冷却会被群成员连发刷爆且 SCP 维基对爬取不友好（宿主 IP 被封所有用户一起吃亏）。
+CATALOG_REFRESH_COOLDOWN = 600
 
 # 浏览器 UA（wikidot 对空 UA/爬虫 UA 可能拒绝）
 USER_AGENT = (
@@ -401,6 +427,11 @@ class ScpArticlePlugin(MaiBotPlugin):
         self._catalog_lock: Optional[asyncio.Lock] = None
         # 官方页头资源内存缓存：{"INT": (logo_data_uri, bg_data_uri), ...}
         self._header_cache: Dict[str, Tuple[str, str]] = {}
+        # 内置兜底页头资源缓存（随插件发布的 assets/header_<BRANCH>.json）：
+        # 命中一次就缓存（含失败时的空串，避免每次查询都读盘）
+        self._bundled_cache: Dict[str, Tuple[str, str]] = {}
+        # /scp刷新目录 per-stream 冷却：{stream_id: 上次刷新时间戳}
+        self._refresh_ts: Dict[str, float] = {}
 
     # ==================== 生命周期 ====================
 
@@ -473,14 +504,27 @@ class ScpArticlePlugin(MaiBotPlugin):
     # ==================== HTTP ====================
 
     def _site_for_branch(self, branch: str) -> str:
-        """返回指定分部（"INT" 国际站 / "CN" 中站）规范化后的站点根地址。"""
+        """返回指定分部（"INT" 国际站 / "CN" 中站）规范化后的站点根地址。
+
+        SSRF 加固：配置地址必须通过站点白名单校验（https + 官方 wikidot 域名），
+        校验失败时记告警并回退默认站，绝不使用可疑地址发请求。
+        """
+        fallback = CN_SITE if branch == "CN" else INT_SITE
         site = (
             str(self.config.fetch.site_url_cn or "").strip()
             if branch == "CN"
             else str(self.config.fetch.site_url_int or "").strip()
         )
         if not site:
-            site = CN_SITE if branch == "CN" else INT_SITE
+            site = fallback
+        else:
+            ok, reason = validate_site_url(site)
+            if not ok:
+                self.ctx.logger.warning(
+                    "配置站点地址未通过白名单校验（%s：%s），回退默认站 %s",
+                    reason, site, fallback,
+                )
+                site = fallback
         return site.rstrip("/")
 
     def _content_site_order(self, branch: str, force_lang: str = "") -> List[str]:
@@ -514,13 +558,53 @@ class ScpArticlePlugin(MaiBotPlugin):
             follow_redirects=True,
         )
 
+    @staticmethod
+    async def _read_capped(resp: httpx.Response, limit: int) -> bytes:
+        """流式读取响应体并施加大小上限（防御超大/被污染响应吃满内存）。
+
+        先查 Content-Length（可提前拒绝），再逐块读取，累计超限即中止并抛异常。
+        """
+        clen = resp.headers.get("content-length")
+        if clen and clen.isdigit() and int(clen) > limit:
+            raise ValueError(f"响应体 Content-Length {clen} 超过上限 {limit} 字节")
+        buf = bytearray()
+        async for chunk in resp.aiter_bytes():
+            buf.extend(chunk)
+            if len(buf) > limit:
+                raise ValueError(f"响应体超过 {limit} 字节上限，已中止读取")
+        return bytes(buf)
+
     async def _fetch_page(self, slug: str, site: str) -> str:
-        """抓取指定站点上 slug 页面的 HTML，失败抛异常。"""
+        """抓取指定站点上 slug 页面的 HTML（流式 + 大小上限），失败抛异常。
+
+        拼 URL 前再校验一次 slug 形态（纵深防御）：slug 可能来自本地目录缓存文件
+        （旧版本写入，未经新过滤）或 /scp rand 的随机抽取，绝不允许含 `%`、
+        斜杠、空白等的值进入请求路径。
+        """
+        slug = str(slug or "").strip().lower()
+        if not is_safe_slug(slug):
+            raise ValueError(f"slug 形态非法，拒绝请求：{slug[:64]!r}")
         url = f"{site.rstrip('/')}/{slug}"
         async with self._client() as client:
-            resp = await client.get(url)
+            req = client.build_request("GET", url)
+            resp = await client.send(req, stream=True)
+            try:
+                resp.raise_for_status()
+                raw = await self._read_capped(resp, MAX_RESPONSE_BYTES)
+                charset = resp.charset_encoding or "utf-8"
+            finally:
+                await resp.aclose()
+        return raw.decode(charset, errors="replace")
+
+    async def _fetch_asset(self, client: httpx.AsyncClient, url: str) -> bytes:
+        """抓取官方页头资源（流式 + 大小上限），失败抛异常。"""
+        req = client.build_request("GET", url)
+        resp = await client.send(req, stream=True)
+        try:
             resp.raise_for_status()
-            return resp.text
+            return await self._read_capped(resp, MAX_ASSET_BYTES)
+        finally:
+            await resp.aclose()
 
     # ==================== 目录构建 ====================
 
@@ -585,11 +669,18 @@ class ScpArticlePlugin(MaiBotPlugin):
         ) as client:
             for slug in CATALOG_INDEX_PAGES:
                 try:
-                    resp = await client.get(f"{site}/{slug}")
-                    if resp.status_code != 200:
-                        self.ctx.logger.warning("索引页 %s 返回 HTTP %s", slug, resp.status_code)
-                        continue
-                    items = parse_catalog_items(resp.text)
+                    req = client.build_request("GET", f"{site}/{slug}")
+                    resp = await client.send(req, stream=True)
+                    try:
+                        if resp.status_code != 200:
+                            self.ctx.logger.warning("索引页 %s 返回 HTTP %s", slug, resp.status_code)
+                            continue
+                        html_text = (await self._read_capped(resp, MAX_RESPONSE_BYTES)).decode(
+                            resp.charset_encoding or "utf-8", errors="replace"
+                        )
+                    finally:
+                        await resp.aclose()
+                    items = parse_catalog_items(html_text)
                     collected.extend(items)
                 except Exception as e:
                     # 单个索引页失败不影响整体（网络抖动容忍）
@@ -602,6 +693,51 @@ class ScpArticlePlugin(MaiBotPlugin):
         """官方页头资源的磁盘缓存路径。"""
         return os.path.join(str(self.ctx.paths.data_dir), f"header_assets_{branch}.json")
 
+    @staticmethod
+    def _bundled_header_file(branch: str) -> str:
+        """内置兜底页头资源的路径（随插件发布的 assets/header_<BRANCH>.json）。"""
+        return str(Path(__file__).resolve().parent / BUNDLED_ASSET_DIR
+                   / f"header_{branch}.json")
+
+    @staticmethod
+    def _has_assets(uris: Tuple[str, str]) -> bool:
+        """判断页头资源 (logo, bg) 是否**真的**可用。
+
+        注意：不能用 `if uris:` —— `("", "")` 是非空元组，真值为 True，
+        会把「两个都没有」误判成有资源（这是 0.3.0 潜在的判断错误）。
+        """
+        return bool(uris) and bool(uris[0]) and bool(uris[1])
+
+    def _load_bundled_header(self, branch: str) -> Tuple[str, str]:
+        """载入内置兜底页头资源（开发期抓到的官方页头），返回 (logo, bg) data URI。
+
+        仅在「下载失败且本机无任何磁盘缓存」时使用：把当时获取到的官方页头渲染
+        固化为长期兜底，避免退化为纯色横幅 + 文字徽标。文件缺失或版本不符时返回
+        空串（仍走原兜底），结果按分部缓存（失败也缓存，避免每次查询都读盘）。
+        """
+        if branch in self._bundled_cache:
+            return self._bundled_cache[branch]
+        uris: Tuple[str, str] = ("", "")
+        path = self._bundled_header_file(branch)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if (isinstance(data, dict) and data.get("logo") and data.get("bg")
+                    and int(data.get("schema") or 0) >= BUNDLED_ASSET_SCHEMA):
+                uris = (str(data["logo"]), str(data["bg"]))
+                self.ctx.logger.info(
+                    "已载入%s内置兜底页头资源（快照 %s）",
+                    BRANCH_LABELS.get(branch, branch), data.get("generated_at") or "未知",
+                )
+            else:
+                self.ctx.logger.warning("内置兜底页头资源格式不符：%s", path)
+        except FileNotFoundError:
+            self.ctx.logger.debug("未找到内置兜底页头资源：%s", path)
+        except Exception as e:
+            self.ctx.logger.warning("读取内置兜底页头资源失败（%s）：%s", path, e)
+        self._bundled_cache[branch] = uris
+        return uris
+
     async def _get_header_assets(self, branch: str) -> Tuple[str, str]:
         """获取指定分部官方页头资源（logo + 横幅底纹）的 data URI。
 
@@ -609,11 +745,18 @@ class ScpArticlePlugin(MaiBotPlugin):
         经 httpx 下载后内嵌为 data URI（html2png 默认禁网，外链资源不会加载）。
         底纹为 100×400 整页背景图，下载后立即用 crop_banner_tile 裁出暗色页头带，
         避免浅色正文区被压进横幅（横幅下半发白）。
-        三级缓存：内存 → 磁盘（默认 7 天，存裁剪后版本 v2）→ 下载；
-        下载失败时退回过期磁盘缓存，再不行返回空串（纯色横幅 + 文字徽标兜底）。
+
+        取资源顺序：内存缓存 → 磁盘缓存（7 天内直接用）→ 联网下载 → 过期磁盘缓存
+        → **内置兜底资源**（assets/header_<BRANCH>.json，随插件发布）→ 空串
+        （纯色横幅 + 文字徽标）。即：旧缓存优先于内置快照，内置快照只补"什么都没有"
+        的空缺——离线部署、首次运行就撞上 CDN 故障、或官方改版导致下载失败时，
+        仍能出带官方页头的图。
+
+        资源的"有无"一律用 `_has_assets()` 判断：`("", "")` 真值为 True，
+        直接写 `if uris:` 会把空资源误判成有资源。
         """
         cached = self._header_cache.get(branch)
-        if cached:
+        if cached and self._has_assets(cached):
             return cached
 
         meta = SITE_HEADERS.get(branch) or SITE_HEADERS["INT"]
@@ -633,22 +776,20 @@ class ScpArticlePlugin(MaiBotPlugin):
         except Exception:
             pass
 
-        # 2) 下载官方资源
+        # 2) 下载官方资源；失败时按「过期磁盘缓存 → 内置兜底」降级
         uris: Tuple[str, str] = ("", "")
         if self.config.fetch.fetch_enabled:
             try:
                 async with self._client() as client:
-                    r_logo = await client.get(meta["logo"])
-                    r_logo.raise_for_status()
-                    r_bg = await client.get(meta["bg"])
-                    r_bg.raise_for_status()
-                bg_cropped = crop_banner_tile(r_bg.content, meta["bg_mime"])
-                if len(bg_cropped) != len(r_bg.content):
+                    logo_bytes = await self._fetch_asset(client, meta["logo"])
+                    bg_bytes = await self._fetch_asset(client, meta["bg"])
+                bg_cropped = crop_banner_tile(bg_bytes, meta["bg_mime"])
+                if len(bg_cropped) != len(bg_bytes):
                     self.ctx.logger.debug("已裁剪%s横幅底纹暗色带（%d -> %d 字节）",
                                           BRANCH_LABELS.get(branch, branch),
-                                          len(r_bg.content), len(bg_cropped))
+                                          len(bg_bytes), len(bg_cropped))
                 uris = (
-                    to_data_uri(r_logo.content, meta["logo_mime"]),
+                    to_data_uri(logo_bytes, meta["logo_mime"]),
                     to_data_uri(bg_cropped, meta["bg_mime"]),
                 )
                 try:
@@ -659,18 +800,21 @@ class ScpArticlePlugin(MaiBotPlugin):
                 except Exception as e:
                     self.ctx.logger.warning("写入页头资源缓存失败：%s", e)
             except Exception as e:
+                # 降级：过期磁盘缓存 → 内置兜底资源 → 空串（纯色横幅）
+                uris = stale if self._has_assets(stale) else self._load_bundled_header(branch)
                 self.ctx.logger.warning(
                     "获取%s官方页头资源失败，%s",
                     BRANCH_LABELS.get(branch, branch),
-                    "使用过期缓存兜底" if stale != ("", "") else "将以纯色横幅渲染",
+                    "使用过期缓存兜底" if self._has_assets(stale) else
+                    ("使用内置兜底资源渲染" if self._has_assets(uris) else "将以纯色横幅渲染"),
                 )
                 self.ctx.logger.debug("页头资源下载失败详情：%s", e)
-                uris = stale
         else:
-            uris = stale
+            # 关闭联网抓取：过期缓存 → 内置兜底
+            uris = stale if self._has_assets(stale) else self._load_bundled_header(branch)
 
         # 失败结果（空 URI）不进内存缓存：下次查询重试下载
-        if uris != ("", ""):
+        if self._has_assets(uris):
             self._header_cache[branch] = uris
         return uris
 
@@ -1246,10 +1390,17 @@ class ScpArticlePlugin(MaiBotPlugin):
             return False, "目录无该分部", 2
 
         pick = random.choice(pool)
-        slug = str(pick.get("slug") or "")
+        slug = str(pick.get("slug") or "").strip().lower()
         if not slug:
             await self._send_text("随机抽取失败，请重试。", stream_id)
             return False, "抽取失败", 2
+        # 纵深防御：目录可能来自旧版本写入的 catalog.json（未经新过滤）
+        if not is_safe_slug(slug):
+            await self._send_text(
+                "随机抽到的条目路径异常，已忽略。可执行 /scp刷新目录 重建目录后重试。",
+                stream_id,
+            )
+            return False, "目录条目路径异常", 2
         return await self._handle_article(
             stream_id, slug, 0, branch, text_mode=text_mode, force_lang=force_lang
         )
@@ -1331,11 +1482,26 @@ class ScpArticlePlugin(MaiBotPlugin):
         pattern=r"(?<!\S)/?scp刷新目录\s*$",
     )
     async def cmd_refresh_catalog(self, **kwargs: Any) -> Tuple[bool, str, int]:
-        """`/scp刷新目录`：强制重新抓取系列索引页构建条目目录。"""
+        """`/scp刷新目录`：强制重新抓取系列索引页构建条目目录。
+
+        带 per-stream 冷却（默认 10 分钟）：一次刷新要抓 15 个索引页、约 20 秒，
+        无冷却会被群成员连发刷爆且 SCP 维基对爬取不友好（宿主 IP 被封所有用户吃亏）。
+        """
         stream_id = str(kwargs.get("stream_id") or "")
         if not self.config.fetch.fetch_enabled:
             await self._send_text("插件已关闭联网抓取，无法刷新目录。", stream_id)
             return False, "联网抓取已关闭", 2
+        now = time.time()
+        remaining = int(CATALOG_REFRESH_COOLDOWN - (now - self._refresh_ts.get(stream_id, 0.0)))
+        if remaining > 0:
+            minutes = max(1, (remaining + 59) // 60)
+            await self._send_text(
+                f"刷新太频繁（每 {CATALOG_REFRESH_COOLDOWN // 60} 分钟一次），"
+                f"请约 {minutes} 分钟后再试（防止 SCP 维基限流/封 IP）。",
+                stream_id,
+            )
+            return False, "刷新冷却中", 2
+        self._refresh_ts[stream_id] = now
         await self._send_text("正在刷新 SCP 条目目录（约需 20 秒）…", stream_id)
         ok, err = await self._ensure_catalog(force=True)
         if not ok:
