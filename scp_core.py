@@ -93,6 +93,10 @@ SITE_HEADERS: Dict[str, Dict[str, str]] = {
 # body_bg 设计总高 400 行中暗色页头带的行数（两站设计一致，实测 CN 在 165 行起变浅色）
 BANNER_TILE_DARK_ROWS = 164
 
+# PNG 解码像素总数上限（防御解压炸弹）：官方页头底纹远小于此值；
+# 超限的图不参与解码，由调用方回退为不裁剪/兜底色。
+MAX_PNG_PIXELS = 16_000_000
+
 # 分部显示名（用于用户提示）
 BRANCH_LABELS: Dict[str, str] = {"INT": "国际站", "CN": "中站"}
 
@@ -320,9 +324,43 @@ def force_branch_slug(slug: str, branch: str) -> str:
     return slug
 
 
+# ==================== 管理员名单 ====================
+
+# 0.3.3（2026-09-29 二轮）：管理员判定实现统一收敛到公共模块 admin_util.py
+# （来源 cateye_common，随插件分发），此处仅 re-export 保持
+# `from scp_core import plain_id / collect_admins` 的既有导入路径兼容。
+try:  # 作为包内模块导入时走相对导入
+    from .admin_util import collect_admins, plain_id
+except ImportError:  # pragma: no cover - 独立模块加载时走绝对导入
+    from admin_util import collect_admins, plain_id  # type: ignore[no-redef]
+
+
 def to_data_uri(content: bytes, mime: str) -> str:
     """把二进制内容编码为 data URI（用于在离线渲染的 HTML 内嵌官方页头图片）。"""
     return f"data:{mime};base64,{base64.b64encode(content).decode('ascii')}"
+
+
+# data URI 白名单（0.3.3 加固）：页头资源 URI 注入 HTML src/CSS 前必须匹配
+# 「data:image/(png|svg+xml);base64,<纯 base64>」形态。正常内容来自内部
+# to_data_uri()（必然匹配）；磁盘缓存 header_assets_*.json / 内置快照若被写入
+# 任意字符串（含 `"`、`()`、`javascript:` 等），不匹配即按资源缺失处理走兜底链，
+# 杜绝注入逃逸出 src 属性 / CSS url()（html2png 默认禁网，实际影响限于渲染异常/
+# 内容伪造，属本地文件信任边界加固）。
+_DATA_URI_RE = re.compile(r"^data:image/(?:png|svg\+xml);base64,[A-Za-z0-9+/=]+$")
+# 长度上限：MAX_ASSET_BYTES（4MB）资源 base64 后约 5.6M 字符，留余量
+MAX_DATA_URI_CHARS = 8 * 1024 * 1024
+
+
+def is_safe_data_uri(uri: str) -> bool:
+    """判断 data URI 是否可安全注入 HTML 属性 / CSS url()（形态白名单 + 长度上限）。
+
+    仅放行 `data:image/png` 与 `data:image/svg+xml` 的纯 base64 载荷
+    （字符集 [A-Za-z0-9+/=]，不含引号/括号/空白/百分号等可逃逸属性或 CSS 的字符）。
+    """
+    s = str(uri or "")
+    if not s or len(s) > MAX_DATA_URI_CHARS:
+        return False
+    return bool(_DATA_URI_RE.match(s))
 
 
 # ==================== 官方底纹裁剪（纯 stdlib，无 Pillow 依赖） ====================
@@ -332,6 +370,15 @@ def _png_decode_rows(data: bytes) -> Optional[Tuple[int, int, int, List[bytes]]]
     """解码 8-bit 非隔行 PNG（RGB/RGBA/Gray），返回 (w, h, 每像素字节数, 行数据)。
 
     不支持的格式（隔行 / 调色板 / 16-bit 等）返回 None，由调用方回退为不裁剪。
+    像素总数超过 MAX_PNG_PIXELS 的按不支持处理（防御解压炸弹：4MB 以内的
+    恶意 PNG 可声明超大 w×h，解压后吃满进程内存）。
+
+    0.3.3 加固：IDAT 改为 decompressobj 分块解压并限制累计输出——
+    MAX_PNG_PIXELS 只能约束 IHDR 声明的 w×h，拦不住「声明 100×400（可通过
+    校验）却携带 4MB 高压缩比 IDAT」的炸弹（zlib.decompress 会先把整个流
+    解压完）。解压输出上限取 `(stride + 1) * h`（合法 PNG 的精确解压尺寸：
+    每行 1 字节滤波类型 + stride 字节像素），与 MAX_PNG_PIXELS 关联、
+    超限立即中止并按不支持格式处理。
     """
     import struct
     import zlib
@@ -352,6 +399,8 @@ def _png_decode_rows(data: bytes) -> Optional[Tuple[int, int, int, List[bytes]]]
                 return None
             if depth != 8 or interlace != 0 or ctype not in (0, 2, 6):
                 return None
+            if w * h > MAX_PNG_PIXELS:
+                return None
             meta = (w, h, ctype)
         elif typ == b"IDAT":
             idat += chunk
@@ -361,10 +410,21 @@ def _png_decode_rows(data: bytes) -> Optional[Tuple[int, int, int, List[bytes]]]
     w, h, ctype = meta
     bpp = {0: 1, 2: 3, 6: 4}[ctype]
     stride = w * bpp
+    # 分块解压 + 累计输出上限（合法流恰好 (stride+1)*h 字节，超限即炸弹）
+    limit = (stride + 1) * h
+    d = zlib.decompressobj()
+    raw = bytearray()
     try:
-        raw = zlib.decompress(idat)
+        for i in range(0, len(idat), 65536):
+            raw += d.decompress(idat[i:i + 65536])
+            if len(raw) > limit:
+                return None
+        raw += d.flush()
     except zlib.error:
         return None
+    if len(raw) > limit:
+        return None
+    raw = bytes(raw)
     rows: List[bytes] = []
     prev = bytearray(stride)
     p = 0
@@ -895,6 +955,11 @@ def build_article_html(
     site_subtitle = site_subtitle or meta.get("subtitle", "")
     banner_color = meta.get("banner_color", "#32302f")
 
+    # 注入前防御（0.3.3）：data URI 必须通过形态白名单校验，不合法一律丢弃、
+    # 走文字徽标 / 纯色横幅兜底——上游缓存文件即使被写入恶意字符串也进不了 HTML。
+    logo_uri = logo_data_uri if is_safe_data_uri(logo_data_uri) else ""
+    bg_uri = bg_data_uri if is_safe_data_uri(bg_data_uri) else ""
+
     fs = min(3.0, max(0.5, float(font_scale or 1.5)))
     size_content = round(16 * fs, 1)
     size_title = round(28 * fs, 1)
@@ -907,13 +972,13 @@ def build_article_html(
 
     # 页头：官方 logo（或文字兜底）+ 站名/标语
     logo_html = (
-        f'<img class="logo" src="{logo_data_uri}" alt="logo"/>'
-        if logo_data_uri
+        f'<img class="logo" src="{logo_uri}" alt="logo"/>'
+        if logo_uri
         else '<div class="logo logo-fallback">SCP</div>'
     )
     banner_style = (
-        f'background-image:url({bg_data_uri});'
-        if bg_data_uri
+        f'background-image:url({bg_uri});'
+        if bg_uri
         else ""
     )
 
@@ -966,14 +1031,19 @@ __all__ = [
     "slug_branch",
     "force_branch_slug",
     "to_data_uri",
+    "is_safe_data_uri",
+    "MAX_DATA_URI_CHARS",
     "validate_site_url",
     "ALLOWED_SITE_HOSTS",
+    "plain_id",
+    "collect_admins",
     "is_safe_slug",
     "MAX_SLUG_LEN",
     "crop_png_rows",
     "crop_svg_top",
     "crop_banner_tile",
     "BANNER_TILE_DARK_ROWS",
+    "MAX_PNG_PIXELS",
     "clean_article_text",
     "split_paragraph_smart",
     "extract_page_content",

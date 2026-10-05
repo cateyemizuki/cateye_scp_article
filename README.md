@@ -78,7 +78,7 @@
 | `/scp rand` | 随机抽一篇国际站条目 |
 | `/scp cn rand` | 随机抽一篇中站条目 |
 | `/scp` / `/scp help` | 显示帮助 |
-| `/scp刷新目录` | 强制刷新本地条目目录（约 20 秒；同一聊天流 10 分钟冷却） |
+| `/scp刷新目录` | 强制刷新本地条目目录（约 20 秒；同一聊天流 10 分钟冷却，管理员免冷却） |
 
 ## 配置说明
 
@@ -87,19 +87,19 @@
 ```toml
 [plugin]
 enabled = true
-config_version = "0.3.1"
+config_version = "0.3.3"
 
 [fetch]                # 抓取配置
 site_url_int = "https://scp-wiki.wikidot.com"      # 国际站地址（/scp 查询）
 site_url_cn = "https://scp-wiki-cn.wikidot.com"    # 中站地址（/scp cn 查询）
 int_content_zh = true    # 国际站条目优先显示中站译文（无译文回退原文）
-timeout = 20.0                                     # 单次 HTTP 请求超时（秒）
+timeout = 20.0                                     # 单次 HTTP 请求超时（秒，上限 60）
 fetch_enabled = true                               # 是否允许联网抓取正文
 
 [render]               # 展示配置
 send_mode = "image"    # 发送方式：image=渲染图片；text=文本合并转发
 per_image_chars = 5000 # 图片模式：每张图片承载的正文汉字上限
-max_image_pages = 3    # 图片模式：单次最多发送的图片张数
+max_image_pages = 3    # 图片模式：单次最多发送的图片张数（上限 10）
 image_width = 900      # 图片模式：渲染图宽度（像素）
 render_scale = 1.0    # 图片模式：渲染缩放倍率（1.0 保证合并转发同步送达）
 font_scale = 1.5       # 图片模式：字号缩放倍率（1.0 基准正文 16px → 1.5 即 24px）
@@ -112,6 +112,12 @@ show_source = true     # 是否显示原页面链接
 catalog_cache_hours = 168  # 本地目录缓存有效期（小时）
 search_limit = 10          # 搜索返回条数上限
 auto_refresh = true        # 目录缺失/超期时是否自动抓取
+refresh_cooldown_minutes = 10           # /scp刷新目录 成功后的 per-stream 冷却（分钟）
+refresh_fail_cooldown_seconds = 60      # /scp刷新目录 失败后的短暂冷却（秒）
+
+[admins]               # 管理员配置（与宿主 [plugin].permission 并集，自动去重）
+admin_users = []       # 插件侧管理员名单，支持 "123456" 或 "qq:123456"
+admin_bypass_refresh_cooldown = true  # 管理员免 /scp刷新目录 冷却
 ```
 
 ### 关键配置项说明
@@ -128,20 +134,40 @@ auto_refresh = true        # 目录缺失/超期时是否自动抓取
 | `render.max_nodes` | 20 | 文本模式；20 × 1500 = 3 万字，可覆盖约 95% 条目的全文 |
 | `fetch.fetch_enabled` | true | 关闭后仅保留目录搜索/随机（需已有目录缓存） |
 | `catalog.auto_refresh` | true | 关闭后不会自动联网构建目录，可用 `/scp刷新目录` 手动构建 |
+| `admins.admin_users` | [] | 插件侧管理员名单；与宿主 `[plugin].permission` 合并为并集（按剥平台前缀后的纯 ID 去重，宿主 `qq:10001` 与配置 `10001` 算同一人）。本地控制台天然是管理员 |
+| `admins.admin_bypass_refresh_cooldown` | true | 管理员执行 `/scp刷新目录` 不受 10 分钟冷却 |
 
-### 安全约束（0.3.0 / 0.3.1）
+### 安全约束（0.3.0 ~ 0.3.3）
 
 - **站点地址白名单**：`fetch.site_url_int` / `site_url_cn` 只接受 **https + 官方两个
   wikidot 域名**（`scp-wiki.wikidot.com` / `scp-wiki-cn.wikidot.com`）。填内网/环回/
   元数据地址（`127.0.0.1`、`192.168.x.x`、`169.254.169.254` 等）、非 http(s) scheme 或
   白名单外域名都会记告警并回退默认站——配置入口不会被用来把内部服务响应回显进群聊。
+- **重定向逐跳复验（0.3.3）**：抓取不再由 httpx 自动跟随重定向，改为手动逐跳跟随
+  （上限 5 跳），每跳经统一护栏（`url_guard.py`，随插件分发）复验 https scheme、
+  host 白名单与 DNS 解析结果（不落内网/元数据段）——白名单域被劫持或开放重定向时
+  也不会把内网响应抓回群聊。页面限官方 wikidot 域，页头资源限官方 CDN 域
+  （`cdn.scpwiki.com` / `sigma9.scpwikicn.com`）。
 - **slug 严格形态**：条目 slug 一律须为 ASCII 小写字母数字与连字符（≤128 字符），
   目录解析、编号解析、请求拼接三处都校验，百分号编码、`..`、`//`、尾随斜杠等畸形路径
   都进不了请求 URL。
 - **抓取体积上限**：正文 HTML 5MB / 页头资源 4MB，流式读取，先查 `Content-Length`
   再逐块累计，超限立即中止。
-- **目录刷新冷却**：`/scp刷新目录` 同一聊天流 10 分钟一次（一次 15 个索引页、约 20 秒，
-  防止群成员连发导致 SCP 维基限流/封宿主 IP）。
+- **页头资源 data URI 白名单（0.3.3）**：磁盘缓存 / 内置快照中的 logo 与底纹 URI
+  注入渲染 HTML 前须匹配 `data:image/(png|svg+xml);base64,<base64>` 形态且长度合理，
+  不合法按资源缺失处理走兜底链，杜绝本地缓存文件被篡改后的 HTML/CSS 注入。
+- **PNG 解压输出上限（0.3.3）**：页头底纹裁剪解码 PNG 时分块解压并限制累计输出
+  （与声明像素上限 `MAX_PNG_PIXELS` 关联），高压缩比 IDAT 的解压炸弹不再能一次性
+  吃满进程内存。
+- **目录刷新冷却**：`/scp刷新目录` **成功后**同一聊天流 10 分钟一次
+  （`catalog.refresh_cooldown_minutes` 可调；一次 15 个索引页、约 20 秒，防止群成员
+  连发导致 SCP 维基限流/封宿主 IP）；**失败只短暂冷却 60 秒**
+  （`catalog.refresh_fail_cooldown_seconds` 可调），网络抖动后可尽快重试。管理员
+  （宿主 `[plugin].permission` ∪ 插件配置 `admins.admin_users`，去重后）默认免冷却，
+  可用 `admins.admin_bypass_refresh_cooldown` 关闭。刷新期间搜索/随机用旧目录继续
+  应答，不再等待约 20 秒的重建。
+- **配置上界（0.3.3）**：`fetch.timeout` 运行时钳制 ≤ 60 秒、
+  `render.max_image_pages` 钳制 ≤ 10，防止配置侧自伤（拖死单请求 / 上千次渲染）。
 
 > 从 0.1.x/0.2.0 升级：`fetch.site_url` 已拆分为 `site_url_int` / `site_url_cn`，
 > `render.cn_first` 已移除、新增 `fetch.int_content_zh` 与 `render.send_mode / per_image_chars /
@@ -176,9 +202,10 @@ SCP 条目正文字数差异极大（实测中位数 2,459 字，最长 69,191 �
 
 ```
 cateye_scp_article/
-├── _manifest.json    # Manifest v2（capabilities: send.text, send.forward, send.image, render.html2png）
+├── _manifest.json    # Manifest v2（capabilities: send.text, send.forward, send.image, render.html2png, config.get）
 ├── plugin.py         # 插件入口：配置模型、生命周期、分站路由、图片/文本双发送管线
 ├── scp_core.py       # 纯逻辑层（不依赖 SDK，可离线单测）
+├── url_guard.py      # 出站 URL 统一安全护栏（scheme/host/IP 白黑名单 + 重定向逐跳复验）
 ├── assets/           # 内置兜底页头资源（官方 logo + 已裁剪底纹的 data URI 快照）
 │   ├── header_INT.json
 │   └── header_CN.json

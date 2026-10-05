@@ -1,5 +1,81 @@
 # 更新日志
 
+## 0.3.3（2026-09-29）
+
+**安全与规范加固：manifest 补声明 `config.get` 能力（变更需 recheck）；重定向手动逐跳复验白名单；页头 data URI 形态白名单；PNG 分块解压上限；配置 en i18n 补齐；刷新失败冷却缩短与多项上界/锁优化。**
+
+### 变更（审核对账）
+
+- **manifest capabilities 补声明 `config.get`**：0.3.2 新增管理员合并时
+  `_get_admins()` 实际调用了 `ctx.config.get("plugin.permission", None)`，
+  但 capabilities 未同步声明（声明与调用不一致）。0.3.3 补齐并同步 README
+  能力清单——**manifest 变更，需 recheck**。
+- **管理员判定统一（2026-09-29 二轮）**：`plain_id`/`collect_admins` 实现收敛到
+  随插件分发的 `admin_util.py`（来源 cateye_common，提炼自本插件），`scp_core`
+  删除重复实现改为引用公共模块并保留 re-export——既有
+  `from scp_core import plain_id / collect_admins` 导入路径与 `__all__` 不变；
+  宿主 ∪ 插件配置按纯 ID 去重、裸 QQ 号默许、宿主读取失败降级（debug 日志）
+  语义不变。
+
+### 安全加固
+
+- **重定向逐跳复验**：抓取不再由 httpx 自动跟随重定向（`follow_redirects=False`），
+  改为手动逐跳跟随（上限 5 跳），初始地址与每个 `Location` 都经统一护栏
+  （新增 `url_guard.py`，随插件分发，参考 cateye_common 参考实现）校验：
+  https scheme、host 白名单（页面限官方 wikidot 域、页头资源限官方 CDN 域）、
+  DNS 解析结果不落内网/元数据段——白名单域被劫持或开放重定向时响应不再被抓回群聊。
+- **页头资源 data URI 白名单**：磁盘缓存 / 内置快照加载的 logo 与底纹 URI
+  （及注入渲染 HTML 前的最终防线）须匹配 `data:image/(png|svg+xml);base64,<base64>`
+  形态且长度合理，不合法按资源缺失处理走兜底链——本地缓存文件被写入任意字符串
+  时无法再逃逸出 `src` 属性 / CSS `url()`。
+- **PNG 解压输出上限**：底纹裁剪解码 PNG 改用 `decompressobj` 分块解压并限制
+  累计输出为 `(stride+1)*h`（合法 PNG 的精确解压尺寸），超限立即中止——
+  此前的 `zlib.decompress` 会先把整个 IDAT 流解压完，`MAX_PNG_PIXELS` 的
+  声明尺寸校验拦不住「声明小尺寸 + 高压缩比 IDAT」的解压炸弹。
+
+### 新增
+
+- **配置 en i18n 补齐（规范 03-配置系统要求项）**：全部配置字段补充
+  `json_schema_extra.i18n["en"]`（label/hint），全部配置分组补充 `__ui_i18n__`
+  （英文 title/description）；界面语言非中文时 WebUI 不再回退英文裸字段名。
+- **刷新冷却可配置 + 失败短冷却**：新增 `catalog.refresh_cooldown_minutes`
+  （默认 10，仅**成功**后落全量冷却）与 `catalog.refresh_fail_cooldown_seconds`
+  （默认 60，失败多为网络抖动，短暂冷却即可重试）——此前刷新**开始前**就落
+  冷却戳，失败后普通用户也要等满 10 分钟。
+
+### 优化
+
+- **目录刷新不再阻塞搜索**：刷新锁改为仅保证「重建单飞」，构建完成后对内存
+  目录做整体赋值（原子替换快照）；刷新进行中（约 20 秒）搜索/随机直接用旧目录
+  应答，不再等锁。
+- **配置上界加固**：`fetch.timeout` 运行时钳制 ≤ 60 秒、`render.max_image_pages`
+  钳制 ≤ 10（防配置侧自伤：拖死单请求 / 触发上千次渲染）；`/scp刷新目录`
+  成功后顺带清理过期的冷却时间戳键。
+
+## 0.3.2（2026-09-28）
+
+**新增管理员体系：管理员 = 宿主权限 ∪ 插件配置（自动去重），管理员免刷新冷却；并按自检结论加固 PNG 解码内存上限与抓取错误聚合。**
+
+### 新增
+
+- **管理员配置节（`admins`）**：
+  - `admin_users`：插件侧管理员名单，支持 `123456`（纯 ID）与 `qq:123456`（平台前缀）两种写法；
+  - `admin_bypass_refresh_cooldown`：管理员执行 `/scp刷新目录` 时不受每流 10 分钟冷却（默认开）。
+- **管理员 = 宿主 ∪ 插件配置，指向同一人自动去重**：宿主侧读取 `[plugin].permission`
+  （与插件命令权限同源，`ctx.config.get("plugin.permission")`），插件侧读 `admins.admin_users`，
+  统一按剥平台前缀后的纯 ID 比对（宿主 `qq:10001` 与配置 `10001` 只算一人），宿主条目在前、顺序稳定。
+  本地控制台（`is_local_operator`）天然放行；读取宿主配置失败时降级为仅按插件配置判定。
+  纯逻辑函数 `plain_id()` / `collect_admins()` 落在 `scp_core.py`，可离线单测。
+
+### 安全加固（自检结论落地）
+
+- **PNG 解码内存上限**：`crop_png_rows()`（页头底纹裁剪）此前对 4MB 以内的响应体
+  直接 `zlib.decompress`，恶意/被污染的 PNG 可声明超大尺寸形成解压炸弹吃满进程内存。
+  现对像素总数设上限（`MAX_PNG_PIXELS`，1600 万像素），超出按"不支持格式"原样返回
+  （退化为 CSS 兜底色），不再参与解码。
+- **抓取错误聚合**：译文优先时正文会依次尝试两个站点，此前只显示**最后一个**站点的
+  失败原因（如国际站 404 + 中站超时会只报"超时"）。现聚合两站的失败原因一并提示。
+
 ## 0.3.1（2026-09-28）
 
 **补强 0.3.0 的 slug 过滤（评审「两条小的」中的目录条）；并把「当前获取到的站点头部渲染」固化为插件内置兜底资源。**

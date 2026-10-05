@@ -57,6 +57,8 @@ try:
         INT_SITE,
         SITE_HEADERS,
         build_article_html,
+        collect_admins,
+        plain_id,
         build_forward_nodes,
         chunk_by_paragraphs,
         clean_article_text,
@@ -72,6 +74,7 @@ try:
         search_catalog,
         slug_branch,
         to_data_uri,
+        is_safe_data_uri,
         validate_site_url,
     )
 except ImportError:  # pragma: no cover - Runner 以独立模块加载 plugin.py 时走绝对导入
@@ -88,6 +91,8 @@ except ImportError:  # pragma: no cover - Runner 以独立模块加载 plugin.py
         INT_SITE,
         SITE_HEADERS,
         build_article_html,
+        collect_admins,
+        plain_id,
         build_forward_nodes,
         chunk_by_paragraphs,
         clean_article_text,
@@ -96,6 +101,7 @@ except ImportError:  # pragma: no cover - Runner 以独立模块加载 plugin.py
         extract_page_content,
         force_branch_slug,
         is_error_page,
+        is_safe_data_uri,
         is_safe_slug,
         merge_catalog,
         normalize_code,
@@ -105,6 +111,13 @@ except ImportError:  # pragma: no cover - Runner 以独立模块加载 plugin.py
         to_data_uri,
         validate_site_url,
     )
+
+try:
+    # 出站 URL 统一安全护栏（随插件分发，参考 cateye_common/url_guard.py）：
+    # scheme 白名单 + 内网/元数据 IP 黑名单 + 重定向逐跳复验 + 错误脱敏
+    from .url_guard import SafeUrl, UrlGuardError, check_redirect, check_url
+except ImportError:  # pragma: no cover
+    from url_guard import SafeUrl, UrlGuardError, check_redirect, check_url  # type: ignore[no-redef]
 
 # ==================== 常量 ====================
 
@@ -118,7 +131,14 @@ except ImportError:  # pragma: no cover - Runner 以独立模块加载 plugin.py
 # 0.3.1：slug 严格形态校验（ASCII 白名单 + 长度上限，拦下百分号编码 / 尾随斜杠 /
 # 非 ASCII 数字等漏网形态），并在请求前与随机抽取处做纵深防御；
 # 新增内置兜底页头资源（assets/header_<BRANCH>.json，随插件发布）。
-SUPPORTED_CONFIG_VERSION = "0.3.1"
+# 0.3.2：新增 admins 配置节——管理员 = 宿主 [plugin].permission ∪ 插件配置
+# admins.admin_users（按剥平台前缀后的纯 ID 自动去重）；管理员执行 /scp刷新目录
+# 可免 per-stream 冷却（admins.admin_bypass_refresh_cooldown，默认开）。
+# 0.3.3：manifest capabilities 补声明 config.get（_get_admins 实际调用）；
+# 重定向改手动逐跳复验白名单；页头 data URI 形态白名单；PNG 分块解压上限；
+# 配置 i18n（en）补齐；刷新失败冷却缩短；timeout / max_image_pages 上界；
+# 目录刷新与搜索分离锁（刷新期间旧目录继续应答）。
+SUPPORTED_CONFIG_VERSION = "0.3.3"
 
 # 默认发送方式：image（渲染为图片）；可配置为 text（合并转发文本）
 DEFAULT_SEND_MODE = "image"
@@ -185,13 +205,31 @@ BUNDLED_ASSET_SCHEMA = 1
 # HTTP 超时（秒）
 HTTP_TIMEOUT = 20.0
 
+# HTTP 超时上界（秒）：fetch.timeout 是配置侧自伤项，设成 3600 会拖死单请求，
+# 运行时一律钳制到该值以内（0.3.3 加固）
+MAX_HTTP_TIMEOUT = 60.0
+
+# 单次查询最多发送的图片张数上界：max_image_pages 设得过大（如 1000）会触发
+# 上千次渲染拖垮进程，运行时一律钳制到该值以内（0.3.3 加固）
+MAX_IMAGE_PAGES_LIMIT = 10
+
+# 重定向逐跳跟随上限（0.3.3 加固）：follow_redirects 改为手动跟随，
+# 每跳经 url_guard 复验 scheme + host 白名单，超过该跳数视为异常
+MAX_REDIRECTS = 5
+
+# 官方页头资源 CDN 白名单（与 scp_core.SITE_HEADERS 中的 host 一致；
+# 代码常量不受配置影响）。资源下载的重定向同样不得离开官方 CDN 域。
+ALLOWED_ASSET_HOSTS = {"cdn.scpwiki.com", "sigma9.scpwikicn.com"}
+
 # 抓取响应体大小上限（字节）：正文 HTML 5MB / 官方页头资源 4MB。
 # 流式读取并在超限时中止，防御官方 CDN 改版或被污染时超大响应吃满进程内存。
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 MAX_ASSET_BYTES = 4 * 1024 * 1024
 
-# /scp刷新目录 冷却（秒，per-stream）：一次刷新要抓 15 个索引页、约 20 秒，
-# 无冷却会被群成员连发刷爆且 SCP 维基对爬取不友好（宿主 IP 被封所有用户一起吃亏）。
+# /scp刷新目录 成功冷却的默认值（秒，per-stream）：一次刷新要抓 15 个索引页、
+# 约 20 秒，无冷却会被群成员连发刷爆且 SCP 维基对爬取不友好（宿主 IP 被封所有
+# 用户一起吃亏）。0.3.3 起可经 catalog.refresh_cooldown_minutes 配置（默认 10
+# 分钟即该值），失败冷却单独缩短（catalog.refresh_fail_cooldown_seconds，默认 60 秒）。
 CATALOG_REFRESH_COOLDOWN = 600
 
 # 浏览器 UA（wikidot 对空 UA/爬虫 UA 可能拒绝）
@@ -228,22 +266,43 @@ HELP_TEXT = (
 # ==================== 配置模型 ====================
 
 
+def _ui_i18n(en_label: str, en_hint: str = "") -> dict:
+    """字段级英文翻译（并入 json_schema_extra；WebUI 按 i18n[locale]['label'/'hint'] 取用）。
+
+    规范要求（03-配置系统 §5.1）：每个字段至少提供 en 的 label/hint；
+    zh-CN 文案即中文字段名/描述本身，无需重复。
+    """
+    entry: Dict[str, str] = {"label": en_label}
+    if en_hint:
+        entry["hint"] = en_hint
+    return {"i18n": {"en": entry}}
+
+
 class PluginSectionConfig(PluginConfigBase):
     """插件（plugin 配置节）：全局开关与配置版本。"""
 
     __ui_label__ = "插件"
     __ui_icon__ = "package"
     __ui_order__ = 0
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
+        "en": {"title": "Plugin", "description": "Global switches and config version"},
+    }
 
     enabled: bool = Field(
         default=True,
         description="是否启用插件",
-        json_schema_extra={"label": "启用插件", "hint": "插件总开关"},
+        json_schema_extra={
+            "label": "启用插件", "hint": "插件总开关",
+            **_ui_i18n("Enable plugin", "Master switch for the plugin"),
+        },
     )
     config_version: str = Field(
         default=SUPPORTED_CONFIG_VERSION,
         description="配置版本（与插件版本同步，用于检查配置文件是否需要更新）",
-        json_schema_extra={"disabled": True, "hidden": True, "label": "配置版本", "hint": "勿改"},
+        json_schema_extra={
+            "disabled": True, "hidden": True, "label": "配置版本", "hint": "勿改",
+            **_ui_i18n("Config version", "Do not edit"),
+        },
     )
 
 
@@ -253,16 +312,27 @@ class FetchSectionConfig(PluginConfigBase):
     __ui_label__ = "抓取配置"
     __ui_icon__ = "cloud_download"
     __ui_order__ = 1
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
+        "en": {"title": "Fetch", "description": "Site addresses and network behavior"},
+    }
 
     site_url_int: str = Field(
         default=INT_SITE,
         description="国际站（SCP-EN）地址：/scp 默认查询该站。留空则使用默认站点",
-        json_schema_extra={"label": "国际站地址", "hint": "/scp 查询的站点"},
+        json_schema_extra={
+            "label": "国际站地址", "hint": "/scp 查询的站点",
+            **_ui_i18n("International site URL",
+                       "Site queried by /scp; whitelist-validated"),
+        },
     )
     site_url_cn: str = Field(
         default=CN_SITE,
         description="中站（SCP-CN）地址：/scp cn 查询该站，目录标题也取自该站。留空则使用默认站点",
-        json_schema_extra={"label": "中站地址", "hint": "/scp cn 查询的站点"},
+        json_schema_extra={
+            "label": "中站地址", "hint": "/scp cn 查询的站点",
+            **_ui_i18n("Chinese branch site URL",
+                       "Site queried by /scp cn; whitelist-validated"),
+        },
     )
     int_content_zh: bool = Field(
         default=True,
@@ -270,12 +340,20 @@ class FetchSectionConfig(PluginConfigBase):
             "国际站条目是否优先显示中站译文（/scp 173 显示中文内容，页头仍为国际站官方头；"
             "无译文的条目自动回退英文原文）。指令 /scp en <编号> 可单次强制英文原文"
         ),
-        json_schema_extra={"label": "国际站显示中文译文", "hint": "无译文自动回退原文"},
+        json_schema_extra={
+            "label": "国际站显示中文译文", "hint": "无译文自动回退原文",
+            **_ui_i18n("Prefer Chinese translation on EN site",
+                       "Fall back to the original when no translation exists"),
+        },
     )
     timeout: float = Field(
         default=HTTP_TIMEOUT,
-        description="单次 HTTP 请求超时时间（秒）",
-        json_schema_extra={"label": "请求超时（秒）", "hint": "抓取超时（秒）"},
+        description="单次 HTTP 请求超时时间（秒，最大 60）",
+        json_schema_extra={
+            "label": "请求超时（秒）", "hint": "抓取超时（秒），上限 60",
+            **_ui_i18n("Request timeout (seconds)",
+                       "HTTP fetch timeout in seconds, capped at 60"),
+        },
     )
     fetch_enabled: bool = Field(
         default=True,
@@ -283,7 +361,11 @@ class FetchSectionConfig(PluginConfigBase):
             "是否允许联网抓取条目正文。关闭后仅保留本地目录的搜索与随机功能"
             "（正文查询不可用），适用于完全离线的部署环境"
         ),
-        json_schema_extra={"label": "允许联网抓取", "hint": "关闭后只能搜索目录"},
+        json_schema_extra={
+            "label": "允许联网抓取", "hint": "关闭后只能搜索目录",
+            **_ui_i18n("Allow network fetching",
+                       "When off, only local catalog search/random works"),
+        },
     )
 
 
@@ -293,6 +375,9 @@ class RenderSectionConfig(PluginConfigBase):
     __ui_label__ = "展示配置"
     __ui_icon__ = "article"
     __ui_order__ = 2
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
+        "en": {"title": "Display", "description": "Send mode and image/text splitting"},
+    }
 
     send_mode: str = Field(
         default=DEFAULT_SEND_MODE,
@@ -300,7 +385,11 @@ class RenderSectionConfig(PluginConfigBase):
             "发送方式：image = 把文章渲染为图片发送（带对应分部官方页头，"
             "渲染失败自动回退文本）；text = 直接用合并转发文本发送"
         ),
-        json_schema_extra={"label": "发送方式", "hint": "image 或 text"},
+        json_schema_extra={
+            "label": "发送方式", "hint": "image 或 text",
+            **_ui_i18n("Send mode",
+                       "image = render to pictures; text = forwarded text"),
+        },
     )
     per_image_chars: int = Field(
         default=DEFAULT_PER_IMAGE_CHARS,
@@ -308,20 +397,32 @@ class RenderSectionConfig(PluginConfigBase):
             "图片模式：每张图片承载的正文汉字上限（按段落装箱切分，尽量不切断语义）。"
             "调大可减少张数，但图片会更高"
         ),
-        json_schema_extra={"label": "每张图片字数上限", "hint": "图片页字数上限"},
+        json_schema_extra={
+            "label": "每张图片字数上限", "hint": "图片页字数上限",
+            **_ui_i18n("Chars per image",
+                       "Max body chars carried by one image page"),
+        },
     )
     max_image_pages: int = Field(
         default=DEFAULT_MAX_IMAGE_PAGES,
         description=(
-            "图片模式：单次查询最多发送的图片张数（默认 3）。"
+            "图片模式：单次查询最多发送的图片张数（默认 3，上限 10）。"
             "超出部分截断并在图上给出分页命令，可用 /scp <编号> <页号> 继续读取"
         ),
-        json_schema_extra={"label": "单次最多图片张数", "hint": "图片页数上限"},
+        json_schema_extra={
+            "label": "单次最多图片张数", "hint": "图片页数上限（≤10）",
+            **_ui_i18n("Max images per query",
+                       "Extra pages are truncated; capped at 10"),
+        },
     )
     image_width: int = Field(
         default=DEFAULT_IMAGE_WIDTH,
         description="图片模式：渲染图宽度（像素），高度按正文长度自适应",
-        json_schema_extra={"label": "渲染图宽度", "hint": "图片宽度（像素）"},
+        json_schema_extra={
+            "label": "渲染图宽度", "hint": "图片宽度（像素）",
+            **_ui_i18n("Image width (px)",
+                       "Rendered image width in pixels"),
+        },
     )
     render_scale: float = Field(
         default=DEFAULT_RENDER_SCALE,
@@ -329,7 +430,11 @@ class RenderSectionConfig(PluginConfigBase):
             "图片模式：渲染缩放倍率（device_scale_factor，1.0~3.0）。越大越清晰，"
             "但图片体积也越大、转发越慢；默认 1.0 以保证合并转发同步送达"
         ),
-        json_schema_extra={"label": "渲染缩放倍率", "hint": "默认 1.0，调大图片更清晰但更慢"},
+        json_schema_extra={
+            "label": "渲染缩放倍率", "hint": "默认 1.0，调大图片更清晰但更慢",
+            **_ui_i18n("Render scale",
+                       "Higher is sharper but slower; 1.0 recommended"),
+        },
     )
     font_scale: float = Field(
         default=DEFAULT_FONT_SCALE,
@@ -337,7 +442,11 @@ class RenderSectionConfig(PluginConfigBase):
             "图片模式：字号缩放倍率（1.0 为基准：正文 16px），默认 1.5 即正文 24px。"
             "调大字号会让图片更长、负载更大，超限时体积护栏会自动降缩放"
         ),
-        json_schema_extra={"label": "字号缩放倍率", "hint": "默认 1.5（正文 24px）"},
+        json_schema_extra={
+            "label": "字号缩放倍率", "hint": "默认 1.5（正文 24px）",
+            **_ui_i18n("Font scale",
+                       "1.0 base (16px body); 1.5 = 24px body"),
+        },
     )
     per_node_chars: int = Field(
         default=DEFAULT_PER_NODE_CHARS,
@@ -345,7 +454,11 @@ class RenderSectionConfig(PluginConfigBase):
             "文本模式：合并转发中每个节点的字符上限（默认 1500）。"
             "按段落装箱切分，尽量不切断语义；调大需注意平台单消息上限（中文按 3 字节/字）"
         ),
-        json_schema_extra={"label": "每节点字符上限（文本模式）", "hint": "单节点字符上限"},
+        json_schema_extra={
+            "label": "每节点字符上限（文本模式）", "hint": "单节点字符上限",
+            **_ui_i18n("Chars per node (text mode)",
+                       "Max chars per forward node"),
+        },
     )
     max_nodes: int = Field(
         default=DEFAULT_MAX_NODES,
@@ -353,17 +466,64 @@ class RenderSectionConfig(PluginConfigBase):
             "文本模式：单张合并转发卡允许的最大节点数（默认 20）。"
             "超出部分截断并在卡末提示；用户可用 /scp <编号> <页号> 继续读取"
         ),
-        json_schema_extra={"label": "单卡最大节点数（文本模式）", "hint": "单卡节点上限"},
+        json_schema_extra={
+            "label": "单卡最大节点数（文本模式）", "hint": "单卡节点上限",
+            **_ui_i18n("Max nodes per card (text mode)",
+                       "Max nodes per forward card"),
+        },
     )
     forward_nickname: str = Field(
         default=DEFAULT_FORWARD_NICKNAME,
         description="文本模式：合并转发气泡中显示的昵称",
-        json_schema_extra={"label": "转发气泡昵称", "hint": "转发显示昵称"},
+        json_schema_extra={
+            "label": "转发气泡昵称", "hint": "转发显示昵称",
+            **_ui_i18n("Forward nickname",
+                       "Nickname shown in forward bubbles"),
+        },
     )
     show_source: bool = Field(
         default=True,
         description="是否显示原页面链接（图片页脚 / 报文首部）",
-        json_schema_extra={"label": "显示原页面链接", "hint": "附上原链接"},
+        json_schema_extra={
+            "label": "显示原页面链接", "hint": "附上原链接",
+            **_ui_i18n("Show source link",
+                       "Attach the original page link"),
+        },
+    )
+
+
+class AdminSectionConfig(PluginConfigBase):
+    """管理员配置（admins 配置节）：与宿主管理员并集后自动去重。"""
+
+    __ui_label__ = "管理员"
+    __ui_icon__ = "shield_check"
+    __ui_order__ = 4
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
+        "en": {"title": "Admins",
+               "description": "Merged with host permissions and deduplicated"},
+    }
+
+    admin_users: List[str] = Field(
+        default_factory=list,
+        description=(
+            "插件侧管理员名单，与宿主 [plugin].permission 的管理员合并为并集"
+            "（按剥平台前缀后的纯 ID 比对，指向同一人自动去重）。"
+            "支持 '123456'（纯 ID）与 'qq:123456'（平台前缀）两种写法"
+        ),
+        json_schema_extra={
+            "label": "管理员名单", "hint": "与宿主管理员自动去重合并",
+            **_ui_i18n("Admin user list",
+                       "Merged and deduplicated with host admins"),
+        },
+    )
+    admin_bypass_refresh_cooldown: bool = Field(
+        default=True,
+        description="管理员执行 /scp刷新目录 时不受冷却限制（普通用户仍为每 10 分钟一次）",
+        json_schema_extra={
+            "label": "管理员免刷新冷却", "hint": "管理员不受 10 分钟冷却",
+            **_ui_i18n("Admins bypass refresh cooldown",
+                       "Admins skip the catalog refresh cooldown"),
+        },
     )
 
 
@@ -373,6 +533,10 @@ class CatalogSectionConfig(PluginConfigBase):
     __ui_label__ = "目录配置"
     __ui_icon__ = "list"
     __ui_order__ = 3
+    __ui_i18n__: ClassVar[Dict[str, Dict[str, str]]] = {
+        "en": {"title": "Catalog",
+               "description": "Local entry catalog cache and refresh"},
+    }
 
     catalog_cache_hours: int = Field(
         default=DEFAULT_CATALOG_CACHE_HOURS,
@@ -380,12 +544,20 @@ class CatalogSectionConfig(PluginConfigBase):
             "本地条目目录缓存有效期（小时，默认 168 = 7 天）。"
             "超期后下次搜索会重新抓取系列索引页（约 15 页、20 余秒）"
         ),
-        json_schema_extra={"label": "目录缓存有效期（小时）", "hint": "目录缓存时长"},
+        json_schema_extra={
+            "label": "目录缓存有效期（小时）", "hint": "目录缓存时长",
+            **_ui_i18n("Catalog cache lifetime (hours)",
+                       "Index pages are re-fetched when expired"),
+        },
     )
     search_limit: int = Field(
         default=DEFAULT_SEARCH_LIMIT,
         description="关键字搜索返回的候选条数上限",
-        json_schema_extra={"label": "搜索返回条数", "hint": "搜索结果上限"},
+        json_schema_extra={
+            "label": "搜索返回条数", "hint": "搜索结果上限",
+            **_ui_i18n("Search result limit",
+                       "Max entries returned per search"),
+        },
     )
     auto_refresh: bool = Field(
         default=True,
@@ -393,7 +565,30 @@ class CatalogSectionConfig(PluginConfigBase):
             "目录缺失或超期时是否自动抓取。关闭后需等待目录首次构建"
             "（可通过 /scp help 提示手动处理）"
         ),
-        json_schema_extra={"label": "自动刷新目录", "hint": "自动抓取目录"},
+        json_schema_extra={
+            "label": "自动刷新目录", "hint": "自动抓取目录",
+            **_ui_i18n("Auto refresh catalog",
+                       "Fetch index pages when catalog is missing or expired"),
+        },
+    )
+    refresh_cooldown_minutes: int = Field(
+        default=10,
+        description="/scp刷新目录 成功后的 per-stream 冷却（分钟，默认 10）",
+        json_schema_extra={
+            "label": "刷新成功冷却（分钟）", "hint": "成功后同一聊天流冷却时长",
+            **_ui_i18n("Refresh cooldown (minutes)",
+                       "Per-chat cooldown after a successful refresh"),
+        },
+    )
+    refresh_fail_cooldown_seconds: int = Field(
+        default=60,
+        description="/scp刷新目录 失败后的 per-stream 冷却（秒，默认 60；"
+                    "失败多为网络抖动，缩短冷却便于尽快重试）",
+        json_schema_extra={
+            "label": "刷新失败冷却（秒）", "hint": "失败后短暂冷却即可重试",
+            **_ui_i18n("Failed refresh cooldown (seconds)",
+                       "Short cooldown after a failed refresh"),
+        },
     )
 
 
@@ -401,6 +596,7 @@ class ScpArticleConfig(PluginConfigBase):
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     fetch: FetchSectionConfig = Field(default_factory=FetchSectionConfig)
     render: RenderSectionConfig = Field(default_factory=RenderSectionConfig)
+    admins: AdminSectionConfig = Field(default_factory=AdminSectionConfig)
     catalog: CatalogSectionConfig = Field(default_factory=CatalogSectionConfig)
 
 
@@ -423,7 +619,9 @@ class ScpArticlePlugin(MaiBotPlugin):
         # 目录内存缓存：{"items": [...], "timestamp": int}
         self._catalog: List[Dict[str, str]] = []
         self._catalog_ts: int = 0
-        # 目录刷新锁：避免并发搜索时重复抓取
+        # 目录刷新锁（0.3.3 改名/改职责）：仅用于刷新单飞（同一时间只有一个
+        # 请求在联网重建目录），构建期间**不再**串行化搜索——搜索/随机直接读
+        # self._catalog 旧快照（列表整体赋值原子替换），不再等 20 秒的锁
         self._catalog_lock: Optional[asyncio.Lock] = None
         # 官方页头资源内存缓存：{"INT": (logo_data_uri, bg_data_uri), ...}
         self._header_cache: Dict[str, Tuple[str, str]] = {}
@@ -501,6 +699,38 @@ class ScpArticlePlugin(MaiBotPlugin):
         hours = int(self.config.catalog.catalog_cache_hours or DEFAULT_CATALOG_CACHE_HOURS)
         return (time.time() - float(self._catalog_ts)) < hours * 3600
 
+    # ==================== 管理员 ====================
+
+    @staticmethod
+    def _extract_requester(kwargs: Dict[str, Any]) -> str:
+        """从组件 kwargs 里取触发者的用户 ID（剥平台前缀后的纯 ID）。"""
+        message = kwargs.get("message") if isinstance(kwargs.get("message"), dict) else {}
+        user_info = message.get("user_info") if isinstance(message.get("user_info"), dict) else {}
+        user_id = kwargs.get("user_id") or user_info.get("user_id") or ""
+        return plain_id(user_id)
+
+    async def _get_admins(self) -> List[str]:
+        """管理员并集：宿主 [plugin].permission ∪ 插件配置 admins.admin_users。
+
+        两侧统一剥平台前缀（'qq:10001' 与 '10001' 视为同一人）后去重；
+        读取宿主配置失败时降级为仅按插件配置判定（记 debug 日志，不抛异常）。
+        """
+        host_perms: Any = None
+        try:
+            host_perms = await self.ctx.config.get("plugin.permission", None)
+        except Exception as e:
+            self.ctx.logger.debug("读取宿主管理员配置（plugin.permission）失败，仅按插件配置判定：%s", e)
+        return collect_admins(host_perms, list(self.config.admins.admin_users or []))
+
+    async def _is_admin(self, kwargs: Dict[str, Any]) -> bool:
+        """判定触发者是否管理员：本地控制台天然放行，其余比对宿主+插件配置并集。"""
+        if kwargs.get("is_local_operator"):
+            return True
+        requester = self._extract_requester(kwargs)
+        if not requester:
+            return False
+        return requester in await self._get_admins()
+
     # ==================== HTTP ====================
 
     def _site_for_branch(self, branch: str) -> str:
@@ -548,15 +778,69 @@ class ScpArticlePlugin(MaiBotPlugin):
         return [home]
 
     def _client(self) -> httpx.AsyncClient:
-        """构造带 UA 与超时的 HTTP 客户端。"""
+        """构造带 UA 与超时的 HTTP 客户端。
+
+        0.3.3 加固：follow_redirects 改为 False——httpx 自动跟随重定向时不复验
+        目标地址，白名单域 302 到内网/元数据地址会把响应抓回来；改由
+        `_send_follow_redirects()` 手动逐跳跟随并复验。超时钳制到 MAX_HTTP_TIMEOUT
+        （配置侧自伤项上界）。
+        """
         timeout = float(self.config.fetch.timeout or HTTP_TIMEOUT)
         if timeout <= 0:
             timeout = HTTP_TIMEOUT
+        timeout = min(timeout, MAX_HTTP_TIMEOUT)
         return httpx.AsyncClient(
             timeout=timeout,
             headers={"User-Agent": USER_AGENT},
-            follow_redirects=True,
+            follow_redirects=False,
         )
+
+    @staticmethod
+    async def _send_follow_redirects(
+        client: httpx.AsyncClient, url: str, allowed_hosts
+    ) -> Tuple[httpx.Response, "SafeUrl"]:
+        """发送 GET 请求并手动逐跳跟随重定向（每跳复验 scheme + host 白名单）。
+
+        SSRF 加固（0.3.3 M2）：初始 URL 与每个重定向 Location 都经 url_guard
+        校验——https scheme、host 在 allowed_hosts 白名单内、DNS 解析结果不落
+        内网/元数据段；相对 Location 继承当前 host 后同样做 host 白名单比对。
+        跳数超过 MAX_REDIRECTS 视为异常。
+
+        Args:
+            client: httpx 异步客户端（follow_redirects=False）。
+            url: 初始请求地址。
+            allowed_hosts: 允许的 host 集合（页面用官方 wikidot 域，
+                页头资源用官方 CDN 域），语义与 fetch.site_url 白名单一致。
+
+        Returns:
+            (最终响应, 最终地址 SafeUrl)；调用方负责读取响应体与 aclose()。
+
+        Raises:
+            ValueError: 地址未通过白名单/黑名单校验、重定向缺 Location 或跳数超限
+                （文案已脱敏，可直接回显聊天）。
+        """
+        allowed = {str(h).lower().rstrip(".") for h in allowed_hosts}
+        try:
+            safe = await check_url(url, allowed_hosts=tuple(allowed))
+        except UrlGuardError as e:
+            raise ValueError(f"目标地址未通过安全校验（{e}）") from e
+        for _ in range(MAX_REDIRECTS + 1):
+            req = client.build_request("GET", safe.reconstruct())
+            resp = await client.send(req, stream=True)
+            if not resp.is_redirect:
+                return resp, safe
+            location = resp.headers.get("location", "")
+            await resp.aclose()
+            if not location:
+                raise ValueError("重定向缺少跳转地址，已中止")
+            try:
+                nxt = await check_redirect(safe, location)
+            except UrlGuardError as e:
+                raise ValueError(f"重定向目标未通过安全校验（{e}）") from e
+            if nxt.host.lower() not in allowed:
+                raise ValueError("重定向目标不在允许的站点白名单内，已中止")
+            safe = nxt
+        raise ValueError("重定向跳数超过上限，已中止")
 
     @staticmethod
     async def _read_capped(resp: httpx.Response, limit: int) -> bytes:
@@ -586,8 +870,8 @@ class ScpArticlePlugin(MaiBotPlugin):
             raise ValueError(f"slug 形态非法，拒绝请求：{slug[:64]!r}")
         url = f"{site.rstrip('/')}/{slug}"
         async with self._client() as client:
-            req = client.build_request("GET", url)
-            resp = await client.send(req, stream=True)
+            # 重定向手动逐跳复验白名单（0.3.3 M2 加固）
+            resp, _ = await self._send_follow_redirects(client, url, ALLOWED_SITE_HOSTS)
             try:
                 resp.raise_for_status()
                 raw = await self._read_capped(resp, MAX_RESPONSE_BYTES)
@@ -597,9 +881,11 @@ class ScpArticlePlugin(MaiBotPlugin):
         return raw.decode(charset, errors="replace")
 
     async def _fetch_asset(self, client: httpx.AsyncClient, url: str) -> bytes:
-        """抓取官方页头资源（流式 + 大小上限），失败抛异常。"""
-        req = client.build_request("GET", url)
-        resp = await client.send(req, stream=True)
+        """抓取官方页头资源（流式 + 大小上限），失败抛异常。
+
+        重定向手动逐跳复验官方 CDN 域白名单（0.3.3 M2 加固）。
+        """
+        resp, _ = await self._send_follow_redirects(client, url, ALLOWED_ASSET_HOSTS)
         try:
             resp.raise_for_status()
             return await self._read_capped(resp, MAX_ASSET_BYTES)
@@ -612,12 +898,18 @@ class ScpArticlePlugin(MaiBotPlugin):
         """确保内存目录可用。返回 (是否可用, 错误信息)。
 
         顺序：内存新鲜 → 磁盘缓存 → 联网抓取系列索引页。
-        通过 asyncio.Lock 防止并发重复抓取。
+        0.3.3 起刷新与搜索分离：`_catalog_lock` 只保证刷新单飞（同一时间
+        只有一个请求在联网重建，约 20 秒），构建完成后对 `self._catalog`
+        做整体赋值（原子替换快照）；刷新进行中若有旧目录，搜索/随机会直接
+        用旧目录应答、不再等锁。
         """
         if not force and self._catalog_fresh():
             return True, ""
         if self._catalog_lock is None:
             self._catalog_lock = asyncio.Lock()
+        if not force and self._catalog_lock.locked() and self._catalog:
+            # 其他请求正在刷新：旧目录（可能已过期）先顶上，不阻塞搜索
+            return True, ""
         async with self._catalog_lock:
             # 双重检查：等锁期间可能已被其他请求刷新
             if not force and self._catalog_fresh():
@@ -644,6 +936,7 @@ class ScpArticlePlugin(MaiBotPlugin):
                 if self._catalog:
                     return True, ""
                 return False, "未从系列索引页解析到任何条目（站点结构可能已变化）"
+            # 快照原子替换：搜索/随机读到的要么是旧列表要么是新列表，无中间态
             self._catalog = items
             self._catalog_ts = int(time.time())
             self._save_catalog_cache()
@@ -658,19 +951,14 @@ class ScpArticlePlugin(MaiBotPlugin):
         国际站条目的 slug（scp-173 等）在中站与国际站一致，仅正文语言不同。
         """
         site = self._site_for_branch("CN")
-        timeout = float(self.config.fetch.timeout or HTTP_TIMEOUT)
-        if timeout <= 0:
-            timeout = HTTP_TIMEOUT
         collected: List[Dict[str, str]] = []
-        async with httpx.AsyncClient(
-            timeout=timeout,
-            headers={"User-Agent": USER_AGENT},
-            follow_redirects=True,
-        ) as client:
+        async with self._client() as client:
             for slug in CATALOG_INDEX_PAGES:
                 try:
-                    req = client.build_request("GET", f"{site}/{slug}")
-                    resp = await client.send(req, stream=True)
+                    # 重定向手动逐跳复验白名单（0.3.3 M2 加固）
+                    resp, _ = await self._send_follow_redirects(
+                        client, f"{site}/{slug}", ALLOWED_SITE_HOSTS
+                    )
                     try:
                         if resp.status_code != 200:
                             self.ctx.logger.warning("索引页 %s 返回 HTTP %s", slug, resp.status_code)
@@ -725,10 +1013,16 @@ class ScpArticlePlugin(MaiBotPlugin):
             if (isinstance(data, dict) and data.get("logo") and data.get("bg")
                     and int(data.get("schema") or 0) >= BUNDLED_ASSET_SCHEMA):
                 uris = (str(data["logo"]), str(data["bg"]))
-                self.ctx.logger.info(
-                    "已载入%s内置兜底页头资源（快照 %s）",
-                    BRANCH_LABELS.get(branch, branch), data.get("generated_at") or "未知",
-                )
+                # data URI 形态白名单（0.3.3 L1 加固）：不合法按缺失处理走兜底链
+                if not (is_safe_data_uri(uris[0]) and is_safe_data_uri(uris[1])):
+                    self.ctx.logger.warning(
+                        "内置兜底页头资源 data URI 未通过形态校验，按缺失处理：%s", path)
+                    uris = ("", "")
+                else:
+                    self.ctx.logger.info(
+                        "已载入%s内置兜底页头资源（快照 %s）",
+                        BRANCH_LABELS.get(branch, branch), data.get("generated_at") or "未知",
+                    )
             else:
                 self.ctx.logger.warning("内置兜底页头资源格式不符：%s", path)
         except FileNotFoundError:
@@ -770,7 +1064,13 @@ class ScpArticlePlugin(MaiBotPlugin):
             if (isinstance(data, dict) and data.get("logo") and data.get("bg")
                     and int(data.get("v") or 0) >= 2):
                 stale = (str(data["logo"]), str(data["bg"]))
-                if (time.time() - float(data.get("ts") or 0)) < DEFAULT_HEADER_CACHE_HOURS * 3600:
+                # data URI 形态白名单（0.3.3 L1 加固）：缓存文件被写入任意字符串时
+                # 不合法即丢弃，走重建（联网下载 → 内置兜底）
+                if not (is_safe_data_uri(stale[0]) and is_safe_data_uri(stale[1])):
+                    self.ctx.logger.warning(
+                        "页头资源缓存 data URI 未通过形态校验，已丢弃待重建：%s", path)
+                    stale = ("", "")
+                elif (time.time() - float(data.get("ts") or 0)) < DEFAULT_HEADER_CACHE_HOURS * 3600:
                     self._header_cache[branch] = stale
                     return stale
         except Exception:
@@ -979,7 +1279,10 @@ class ScpArticlePlugin(MaiBotPlugin):
             渲染 / 发送失败时抛异常，由调用方回退到文本模式。
         """
         per_img = max(1000, int(self.config.render.per_image_chars or DEFAULT_PER_IMAGE_CHARS))
-        max_pages = max(1, int(self.config.render.max_image_pages or DEFAULT_MAX_IMAGE_PAGES))
+        # 上界钳制（0.3.3 L5 加固）：max_image_pages 只在配置侧有下限，设成 1000
+        # 会触发上千次渲染拖垮进程，运行时钳制到 MAX_IMAGE_PAGES_LIMIT
+        max_pages = min(MAX_IMAGE_PAGES_LIMIT,
+                        max(1, int(self.config.render.max_image_pages or DEFAULT_MAX_IMAGE_PAGES)))
         width = max(400, int(self.config.render.image_width or DEFAULT_IMAGE_WIDTH))
 
         slices = chunk_by_paragraphs(body, per_img, merge_tail=True)
@@ -1219,29 +1522,32 @@ class ScpArticlePlugin(MaiBotPlugin):
         chosen_site = ""
         page_title = ""
         body = ""
-        net_err = ""
+        # 聚合各站点失败原因：译文优先时最多尝试两站，只报最后一站的错误
+        # 会误导（如国际站 404 + 中站超时只显示"超时"）
+        net_errs: List[str] = []
         for site_url in self._content_site_order(branch, force_lang):
             try:
                 html_text = await self._fetch_page(slug, site_url)
             except httpx.TimeoutException:
-                net_err = "抓取超时，请稍后重试。"
+                net_errs.append(f"{site_url} 抓取超时")
                 continue
             except httpx.HTTPStatusError as e:
-                net_err = f"抓取失败：页面返回 HTTP {e.response.status_code}"
+                net_errs.append(f"{site_url} 返回 HTTP {e.response.status_code}")
                 continue
             except Exception as e:
                 self.ctx.logger.error("抓取 %s@%s 失败：%s", slug, site_url, e)
-                net_err = f"抓取失败：{e}"
+                net_errs.append(f"{site_url} 失败：{e}")
                 continue
             t, b = extract_page_content(html_text)
             if not b or is_error_page(html_text, t):
+                net_errs.append(f"{site_url} 无该条目")
                 continue
             chosen_site, page_title, body = site_url, t, b
             break
 
         if not chosen_site:
-            if net_err:
-                await self._send_text(f"《{slug}》{net_err}", stream_id)
+            if net_errs:
+                await self._send_text(f"《{slug}》抓取失败（{'；'.join(net_errs)}）。", stream_id)
                 return False, "抓取失败", 2
             await self._send_text(
                 f"未找到条目《{slug}》，请检查编号是否正确。\n"
@@ -1484,27 +1790,46 @@ class ScpArticlePlugin(MaiBotPlugin):
     async def cmd_refresh_catalog(self, **kwargs: Any) -> Tuple[bool, str, int]:
         """`/scp刷新目录`：强制重新抓取系列索引页构建条目目录。
 
-        带 per-stream 冷却（默认 10 分钟）：一次刷新要抓 15 个索引页、约 20 秒，
-        无冷却会被群成员连发刷爆且 SCP 维基对爬取不友好（宿主 IP 被封所有用户吃亏）。
+        带 per-stream 冷却（catalog.refresh_cooldown_minutes，默认 10 分钟，
+        仅**成功**后落全量冷却）：一次刷新要抓 15 个索引页、约 20 秒，无冷却会
+        被群成员连发刷爆且 SCP 维基对爬取不友好（宿主 IP 被封所有用户吃亏）。
+        失败（多为网络抖动）只落短暂冷却（catalog.refresh_fail_cooldown_seconds，
+        默认 60 秒），便于尽快重试。管理员（宿主 [plugin].permission ∪ 插件配置
+        admins.admin_users，去重后）可免冷却（admins.admin_bypass_refresh_cooldown，
+        默认开）。
         """
         stream_id = str(kwargs.get("stream_id") or "")
         if not self.config.fetch.fetch_enabled:
             await self._send_text("插件已关闭联网抓取，无法刷新目录。", stream_id)
             return False, "联网抓取已关闭", 2
+        cooldown = max(0, int(self.config.catalog.refresh_cooldown_minutes or 10)) * 60
+        fail_cd = max(0, int(self.config.catalog.refresh_fail_cooldown_seconds or 60))
         now = time.time()
-        remaining = int(CATALOG_REFRESH_COOLDOWN - (now - self._refresh_ts.get(stream_id, 0.0)))
+        remaining = int(cooldown - (now - self._refresh_ts.get(stream_id, 0.0)))
         if remaining > 0:
-            minutes = max(1, (remaining + 59) // 60)
-            await self._send_text(
-                f"刷新太频繁（每 {CATALOG_REFRESH_COOLDOWN // 60} 分钟一次），"
-                f"请约 {minutes} 分钟后再试（防止 SCP 维基限流/封 IP）。",
-                stream_id,
-            )
-            return False, "刷新冷却中", 2
+            # 冷却中：仅当开关打开且触发者确实是管理员时放行（避免每次冷却期都白读一遍配置）
+            bypass = False
+            if self.config.admins.admin_bypass_refresh_cooldown:
+                bypass = await self._is_admin(kwargs)
+            if not bypass:
+                minutes = max(1, (remaining + 59) // 60)
+                await self._send_text(
+                    f"刷新太频繁（每 {cooldown // 60 or 1} 分钟一次），"
+                    f"请约 {minutes} 分钟后再试（防止 SCP 维基限流/封 IP）。",
+                    stream_id,
+                )
+                return False, "刷新冷却中", 2
+        # 先落全量冷却戳防连发；失败时回拨为短暂冷却（0.3.3 前失败也吃全量冷却）
         self._refresh_ts[stream_id] = now
+        # 顺带清理过期的冷却键（L5：长驻进程缓慢累积）
+        for key in [k for k, ts in self._refresh_ts.items()
+                    if now - ts > max(cooldown, fail_cd, 60) * 2]:
+            del self._refresh_ts[key]
         await self._send_text("正在刷新 SCP 条目目录（约需 20 秒）…", stream_id)
         ok, err = await self._ensure_catalog(force=True)
         if not ok:
+            # 失败回拨时间戳，使剩余冷却 = refresh_fail_cooldown_seconds
+            self._refresh_ts[stream_id] = now - max(0.0, float(cooldown - fail_cd))
             await self._send_text(f"刷新失败：{err}", stream_id)
             return False, err or "刷新失败", 2
         await self._send_text(f"目录刷新完成，当前共 {len(self._catalog)} 条。", stream_id)

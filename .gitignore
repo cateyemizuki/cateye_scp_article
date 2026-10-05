@@ -14,3 +14,32 @@ _tmpdata/
 # 流程文档（Agent 专用，永不入库）
 UPLOAD_AGENT.md
 ISSUE_SUBMISSION.md
+
+# ---- 追加自 MaiBot插件开发文档v1.3.0/.gitignore 模板（sync 2026-10-05）----
+/config.toml
+/config_back/
+/data/
+*.log
+.maibot-release.json
+.update_backups/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*_test.py
+smoke_test*.py
+/tests/
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp

@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "github.cateye.scp-article",
-  "version": "0.3.1",
+  "version": "0.3.3",
   "name": "SCP 条目查询",
   "description": "【非商业插件：SCP 基金会各分部维基的文本内容与官方页头素材依 CC BY-SA 3.0 授权（署名与修改说明见仓库 NOTICE.md），插件仅做只读抓取与即时展示，不缓存不转载正文；插件代码按 MIT 提供】按编号或关键字查询 SCP 基金会条目：/scp 查询国际站，/scp cn 查询中文分部。文章默认渲染为图片发送（内嵌对应分部官方页头 logo 与横幅底纹，抓取失败依次回退本机缓存与插件内置兜底资源，经宿主 render.html2png 渲染、send.image 发送，失败自动回退文本合并转发）；本地维护条目目录（编号+标题）实现关键字搜索与随机抽选，长文自动分页。仅提供 /scp 指令，不注册给 LLM 调用的工具。",
   "author": {
@@ -34,7 +34,8 @@
     "send.text",
     "send.forward",
     "send.image",
-    "render.html2png"
+    "render.html2png",
+    "config.get"
   ],
   "i18n": {
     "default_locale": "zh-CN",
