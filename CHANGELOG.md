@@ -1,5 +1,31 @@
 # 更新日志
 
+## 0.3.4（2026-10-08）
+
+**紧急修复 0.3.3 引入的抓取回归：`ALLOWED_SITE_HOSTS` 未随导入清单带入，条目抓取与目录刷新全部抛 `NameError`。**
+
+### 修复
+
+- **条目抓取全线失败（0.3.3 回归）**：0.3.3「重定向逐跳复验」把页面抓取改走
+  `_send_follow_redirects(client, url, ALLOWED_SITE_HOSTS)`（`plugin.py:874` /
+  `plugin.py:960`），但该常量定义在 `scp_core.py:35`，plugin.py 的两个导入块
+  （包内相对导入 / Runner 独立加载时的绝对导入兜底）都没带上它。该名字只在
+  函数体内求值，**模块导入期不报错**（日志里仍是「v0.3.3 加载成功」），跑到抓取
+  那一行才抛 `name 'ALLOWED_SITE_HOSTS' is not defined`：
+  - `/scp <编号>`、`/scp cn <编号>` 全部报「抓取失败」；
+  - `/scp刷新目录` 全部索引页抓取失败（旧目录缓存继续服务，所以搜索/随机看似
+    正常，实际目录再也无法更新）。
+  修复：两个导入块均补上 `ALLOWED_SITE_HOSTS`。页头资源走同日新增的
+  `ALLOWED_ASSET_HOSTS`（定义在 plugin.py 内），一直正常。
+- **回归测试**：`test_security.py` 新增 `test_plugin_imports_complete`——静态扫描
+  plugin.py，凡引用了 `scp_core.__all__` 里的名字却没导入即断言失败，这类
+  「加固改动静默漏导入」不再能通过离线自测（含反向验证：去掉该导入必须被抓出）。
+
+### 变更（审核对账）
+
+- `config_version` → `0.3.4`（Runner 升级时自动重建，配置项无增减，
+  用户既有配置值按类型保留）。manifest `version` 同步 `0.3.4`。
+
 ## 0.3.3（2026-09-29）
 
 **安全与规范加固：manifest 补声明 `config.get` 能力（变更需 recheck）；重定向手动逐跳复验白名单；页头 data URI 形态白名单；PNG 分块解压上限；配置 en i18n 补齐；刷新失败冷却缩短与多项上界/锁优化。**

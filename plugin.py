@@ -51,6 +51,7 @@ from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase
 try:
     # 插件作为包被导入时走相对导入（如 plugins/cateye_scp_article/ 有 __init__.py）
     from .scp_core import (
+        ALLOWED_SITE_HOSTS,
         BRANCH_LABELS,
         CATALOG_INDEX_PAGES,
         CN_SITE,
@@ -85,6 +86,7 @@ except ImportError:  # pragma: no cover - Runner 以独立模块加载 plugin.py
     if str(_PLUGIN_DIR) not in _sys.path:
         _sys.path.insert(0, str(_PLUGIN_DIR))
     from scp_core import (  # type: ignore[no-redef]
+        ALLOWED_SITE_HOSTS,
         BRANCH_LABELS,
         CATALOG_INDEX_PAGES,
         CN_SITE,
@@ -138,7 +140,10 @@ except ImportError:  # pragma: no cover
 # 重定向改手动逐跳复验白名单；页头 data URI 形态白名单；PNG 分块解压上限；
 # 配置 i18n（en）补齐；刷新失败冷却缩短；timeout / max_image_pages 上界；
 # 目录刷新与搜索分离锁（刷新期间旧目录继续应答）。
-SUPPORTED_CONFIG_VERSION = "0.3.3"
+# 0.3.4：紧急修复 0.3.3 引入的抓取回归——重定向加固新调用的 ALLOWED_SITE_HOSTS
+# 只定义在 scp_core，未随导入清单一起带进来，抓取与目录刷新跑到该行即抛
+# NameError（目录读缓存故「搜索/随机正常、抓取必失败」）；两个导入块均补齐。
+SUPPORTED_CONFIG_VERSION = "0.3.4"
 
 # 默认发送方式：image（渲染为图片）；可配置为 text（合并转发文本）
 DEFAULT_SEND_MODE = "image"

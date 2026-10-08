@@ -87,7 +87,7 @@
 ```toml
 [plugin]
 enabled = true
-config_version = "0.3.3"
+config_version = "0.3.4"
 
 [fetch]                # 抓取配置
 site_url_int = "https://scp-wiki.wikidot.com"      # 国际站地址（/scp 查询）
