@@ -43,3 +43,5 @@ desktop.ini
 .idea/
 .vscode/
 *.swp
+
+*$py.class

@@ -55,7 +55,11 @@ def validate_site_url(url: str) -> Tuple[bool, str]:
     raw = str(url or "").strip()
     if not raw:
         return False, "站点地址为空"
-    parsed = urlparse(raw)
+    try:
+        parsed = urlparse(raw)
+        port = parsed.port
+    except ValueError:
+        return False, "站点地址格式无效"
     if parsed.scheme.lower() != "https":
         return False, f"仅允许 https 站点（当前 scheme：{parsed.scheme or '无'}）"
     host = (parsed.hostname or "").lower()
@@ -63,6 +67,10 @@ def validate_site_url(url: str) -> Tuple[bool, str]:
         return False, "站点地址缺少域名"
     if host not in ALLOWED_SITE_HOSTS:
         return False, f"域名 {host} 不在允许的站点白名单内"
+    if parsed.username or parsed.password:
+        return False, "站点地址不能携带凭据"
+    if port not in (None, 443) or parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        return False, "仅允许官方站点根地址与默认 HTTPS 端口"
     return True, ""
 
 # 各分部官方页头资源（来自两站 Sigma-9 主题 CSS 中的 #header / #container-wrap 定义，
@@ -270,7 +278,8 @@ def normalize_code(raw: str) -> str:
     """把用户输入的编号规范化为小写 slug 形式。
 
     支持的输入：`scp-173`、`SCP-173`、`173`、`scpcn2000`、`SCP-CN-2000`、
-    `cn-2000`、`cn2000`。无法识别时返回空串。
+    `cn-2000`、`cn2000`。编号不足三位时补零（`96` → `096`、`1` → `001`）。
+    无法识别时返回空串。
 
     数字一律按 **ASCII** 匹配（`re.ASCII`）：全角「１７３」、阿拉伯-印度数字等
     Unicode 数字不再被当成合法编号，最终还会经 `is_safe_slug` 把关。
@@ -292,15 +301,16 @@ def normalize_code(raw: str) -> str:
     m = re.match(r"^scp-?([a-z]{2,3})?-?(\d+)$", s, re.ASCII)
     if m:
         branch, num = m.group(1), m.group(2)
+        num = num.zfill(3)
         out = f"scp-{branch}-{num}" if branch else f"scp-{num}"
     # 纯数字：173
     elif re.match(r"^\d+$", s, re.ASCII):
-        out = f"scp-{s}"
+        out = f"scp-{s.zfill(3)}"
     else:
         # 分部前缀无 scp：cn-2000 / cn2000 / en-173
         m = re.match(r"^([a-z]{2,3})-?(\d+)$", s, re.ASCII)
         if m:
-            out = f"scp-{m.group(1)}-{m.group(2)}"
+            out = f"scp-{m.group(1)}-{m.group(2).zfill(3)}"
     # 最终把关：拼 URL 前保证 slug 为安全的 ASCII 形态（拒绝 %、/、超长等）
     return out if is_safe_slug(out) else ""
 
@@ -388,6 +398,8 @@ def _png_decode_rows(data: bytes) -> Optional[Tuple[int, int, int, List[bytes]]]
     pos, idat, meta = 8, b"", None
     while pos + 8 <= len(data):
         ln = struct.unpack(">I", data[pos:pos + 4])[0]
+        if pos + 12 + ln > len(data):
+            return None
         typ = data[pos + 4:pos + 8]
         chunk = data[pos + 8:pos + 8 + ln]
         if typ == b"IHDR":
@@ -399,7 +411,7 @@ def _png_decode_rows(data: bytes) -> Optional[Tuple[int, int, int, List[bytes]]]
                 return None
             if depth != 8 or interlace != 0 or ctype not in (0, 2, 6):
                 return None
-            if w * h > MAX_PNG_PIXELS:
+            if not w or not h or w * h > MAX_PNG_PIXELS:
                 return None
             meta = (w, h, ctype)
         elif typ == b"IDAT":
@@ -416,13 +428,13 @@ def _png_decode_rows(data: bytes) -> Optional[Tuple[int, int, int, List[bytes]]]
     raw = bytearray()
     try:
         for i in range(0, len(idat), 65536):
-            raw += d.decompress(idat[i:i + 65536])
-            if len(raw) > limit:
+            # 在分配解压输出之前限制长度；仅分块输入仍可一次膨胀数十 MB。
+            raw += d.decompress(idat[i:i + 65536], limit - len(raw) + 1)
+            if len(raw) > limit or d.unconsumed_tail:
                 return None
-        raw += d.flush()
     except zlib.error:
         return None
-    if len(raw) > limit:
+    if len(raw) != limit or not d.eof or d.unused_data:
         return None
     raw = bytes(raw)
     rows: List[bytes] = []
@@ -432,6 +444,8 @@ def _png_decode_rows(data: bytes) -> Optional[Tuple[int, int, int, List[bytes]]]
         if p >= len(raw):
             return None
         f = raw[p]
+        if f not in (0, 1, 2, 3, 4):
+            return None
         p += 1
         line = bytearray(raw[p:p + stride])
         p += stride

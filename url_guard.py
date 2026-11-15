@@ -13,7 +13,7 @@ import asyncio
 import ipaddress
 import socket
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 __all__ = [
     "UrlGuardError",
@@ -156,11 +156,18 @@ async def check_url(
     return safe
 
 
-async def check_redirect(previous: SafeUrl, location: str, *, allowed_schemes: tuple[str, ...] = DEFAULT_SCHEMES) -> SafeUrl:
-    """重定向逐跳复验：location 允许相对路径，host 变化时重新走完整校验。"""
-    if location.startswith("/"):
-        return SafeUrl(previous.scheme, previous.host, previous.port, location)
-    return await check_url(location, allowed_schemes=allowed_schemes, check_dns=True)
+async def check_redirect(
+    previous: SafeUrl, location: str, *,
+    allowed_schemes: tuple[str, ...] = DEFAULT_SCHEMES,
+    allowed_hosts: tuple[str, ...] | None = None,
+) -> SafeUrl:
+    """按 URL 标准解析相对跳转，每一跳重新校验 scheme、host 与 DNS。"""
+    return await check_url(
+        urljoin(previous.reconstruct(), location),
+        allowed_schemes=allowed_schemes,
+        allowed_hosts=allowed_hosts,
+        check_dns=True,
+    )
 
 
 def cap_stream(chunks, max_bytes: int):

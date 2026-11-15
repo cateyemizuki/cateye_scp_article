@@ -128,13 +128,13 @@ except ImportError:  # pragma: no cover
 # 图片渲染显式传 device_scale_factor（render.render_scale）并加发送体积护栏。
 # 0.2.3：渲染字号放大（render.font_scale 默认 1.5）；图片统一合并转发（单图也入卡）。
 # 0.2.4：修复合并转发假阴性超时下的回退抢跑/内容重复；渲染缩放默认 1.0（字段更名 render_scale）。
-# 0.3.0：站点配置白名单校验（SSRF 加固）；/scp刷新目录 per-stream 冷却；
+# 0.3.0：站点配置白名单校验（SSRF 加固）；/scp refresh per-stream 冷却；
 # 抓取响应体大小上限（流式读取）；目录 slug 过滤畸形路径。
 # 0.3.1：slug 严格形态校验（ASCII 白名单 + 长度上限，拦下百分号编码 / 尾随斜杠 /
 # 非 ASCII 数字等漏网形态），并在请求前与随机抽取处做纵深防御；
 # 新增内置兜底页头资源（assets/header_<BRANCH>.json，随插件发布）。
 # 0.3.2：新增 admins 配置节——管理员 = 宿主 [plugin].permission ∪ 插件配置
-# admins.admin_users（按剥平台前缀后的纯 ID 自动去重）；管理员执行 /scp刷新目录
+# admins.admin_users（按剥平台前缀后的纯 ID 自动去重）；管理员执行 /scp refresh
 # 可免 per-stream 冷却（admins.admin_bypass_refresh_cooldown，默认开）。
 # 0.3.3：manifest capabilities 补声明 config.get（_get_admins 实际调用）；
 # 重定向改手动逐跳复验白名单；页头 data URI 形态白名单；PNG 分块解压上限；
@@ -143,7 +143,7 @@ except ImportError:  # pragma: no cover
 # 0.3.4：紧急修复 0.3.3 引入的抓取回归——重定向加固新调用的 ALLOWED_SITE_HOSTS
 # 只定义在 scp_core，未随导入清单一起带进来，抓取与目录刷新跑到该行即抛
 # NameError（目录读缓存故「搜索/随机正常、抓取必失败」）；两个导入块均补齐。
-SUPPORTED_CONFIG_VERSION = "0.3.4"
+SUPPORTED_CONFIG_VERSION = "0.3.5"
 
 # 默认发送方式：image（渲染为图片）；可配置为 text（合并转发文本）
 DEFAULT_SEND_MODE = "image"
@@ -231,7 +231,7 @@ ALLOWED_ASSET_HOSTS = {"cdn.scpwiki.com", "sigma9.scpwikicn.com"}
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 MAX_ASSET_BYTES = 4 * 1024 * 1024
 
-# /scp刷新目录 成功冷却的默认值（秒，per-stream）：一次刷新要抓 15 个索引页、
+# /scp refresh 成功冷却的默认值（秒，per-stream）：一次刷新要抓 15 个索引页、
 # 约 20 秒，无冷却会被群成员连发刷爆且 SCP 维基对爬取不友好（宿主 IP 被封所有
 # 用户一起吃亏）。0.3.3 起可经 catalog.refresh_cooldown_minutes 配置（默认 10
 # 分钟即该值），失败冷却单独缩短（catalog.refresh_fail_cooldown_seconds，默认 60 秒）。
@@ -251,6 +251,10 @@ CMD_MODIFIERS: Dict[str, str] = {
     "en": "en", "英文": "en", "原文": "en",
 }
 
+# Host 使用 re.search，必须锚定整条消息，且只允许显式的 /scp 根命令。
+# 不使用 aliases：Host 的别名 startswith 匹配会绕过这里的边界检查。
+SCP_COMMAND_PATTERN = r"\A/scp(?:[ \t]+(?P<arg>[^\r\n]*))?[ \t]*\Z"
+
 # 指令帮助文本
 HELP_TEXT = (
     "SCP 条目查询：\n"
@@ -261,6 +265,7 @@ HELP_TEXT = (
     "/scp <编号> <页号>   —— 读取超长条目的后续分页，如 /scp 5000 2\n"
     "/scp [cn] <关键字>   —— 搜索条目（默认国际站，加 cn 搜中站）\n"
     "/scp [cn] rand       —— 随机抽一篇（默认国际站，加 cn 抽中站）\n"
+    "/scp refresh         —— 刷新本地条目目录\n"
     "/scp help            —— 显示本帮助\n"
     "\n"
     "文章默认渲染为图片发送（带对应分部官方页头，多页图片以合并转发一并发出）；"
@@ -523,7 +528,7 @@ class AdminSectionConfig(PluginConfigBase):
     )
     admin_bypass_refresh_cooldown: bool = Field(
         default=True,
-        description="管理员执行 /scp刷新目录 时不受冷却限制（普通用户仍为每 10 分钟一次）",
+        description="管理员执行 /scp refresh 时不受冷却限制（普通用户仍为每 10 分钟一次）",
         json_schema_extra={
             "label": "管理员免刷新冷却", "hint": "管理员不受 10 分钟冷却",
             **_ui_i18n("Admins bypass refresh cooldown",
@@ -578,7 +583,7 @@ class CatalogSectionConfig(PluginConfigBase):
     )
     refresh_cooldown_minutes: int = Field(
         default=10,
-        description="/scp刷新目录 成功后的 per-stream 冷却（分钟，默认 10）",
+        description="/scp refresh 成功后的 per-stream 冷却（分钟，默认 10）",
         json_schema_extra={
             "label": "刷新成功冷却（分钟）", "hint": "成功后同一聊天流冷却时长",
             **_ui_i18n("Refresh cooldown (minutes)",
@@ -587,7 +592,7 @@ class CatalogSectionConfig(PluginConfigBase):
     )
     refresh_fail_cooldown_seconds: int = Field(
         default=60,
-        description="/scp刷新目录 失败后的 per-stream 冷却（秒，默认 60；"
+        description="/scp refresh 失败后的 per-stream 冷却（秒，默认 60；"
                     "失败多为网络抖动，缩短冷却便于尽快重试）",
         json_schema_extra={
             "label": "刷新失败冷却（秒）", "hint": "失败后短暂冷却即可重试",
@@ -633,7 +638,7 @@ class ScpArticlePlugin(MaiBotPlugin):
         # 内置兜底页头资源缓存（随插件发布的 assets/header_<BRANCH>.json）：
         # 命中一次就缓存（含失败时的空串，避免每次查询都读盘）
         self._bundled_cache: Dict[str, Tuple[str, str]] = {}
-        # /scp刷新目录 per-stream 冷却：{stream_id: 上次刷新时间戳}
+        # /scp refresh per-stream 冷却：{stream_id: 冷却截止时间（单调时钟）}
         self._refresh_ts: Dict[str, float] = {}
 
     # ==================== 生命周期 ====================
@@ -756,8 +761,8 @@ class ScpArticlePlugin(MaiBotPlugin):
             ok, reason = validate_site_url(site)
             if not ok:
                 self.ctx.logger.warning(
-                    "配置站点地址未通过白名单校验（%s：%s），回退默认站 %s",
-                    reason, site, fallback,
+                    "配置站点地址未通过白名单校验（%s），回退默认站 %s",
+                    reason, fallback,
                 )
                 site = fallback
         return site.rstrip("/")
@@ -839,7 +844,7 @@ class ScpArticlePlugin(MaiBotPlugin):
             if not location:
                 raise ValueError("重定向缺少跳转地址，已中止")
             try:
-                nxt = await check_redirect(safe, location)
+                nxt = await check_redirect(safe, location, allowed_hosts=tuple(allowed))
             except UrlGuardError as e:
                 raise ValueError(f"重定向目标未通过安全校验（{e}）") from e
             if nxt.host.lower() not in allowed:
@@ -926,7 +931,7 @@ class ScpArticlePlugin(MaiBotPlugin):
                 # 先尝试读磁盘缓存（可能是上次运行留下的）
                 if self._load_catalog_cache() and self._catalog:
                     return True, ""
-                return False, "目录尚未构建，且已关闭自动刷新（可执行 /scp刷新目录 手动构建）"
+                return False, "目录尚未构建，且已关闭自动刷新（可执行 /scp refresh 手动构建）"
             if not self.config.fetch.fetch_enabled:
                 return (bool(self._catalog),
                         "" if self._catalog else "插件已关闭联网抓取，且本地无目录缓存")
@@ -934,11 +939,11 @@ class ScpArticlePlugin(MaiBotPlugin):
                 items = await self._build_catalog()
             except Exception as e:
                 self.ctx.logger.error("构建条目目录失败：%s", e)
-                if self._catalog:
+                if self._catalog and not force:
                     return True, ""
                 return False, f"构建条目目录失败：{e}"
             if not items:
-                if self._catalog:
+                if self._catalog and not force:
                     return True, ""
                 return False, "未从系列索引页解析到任何条目（站点结构可能已变化）"
             # 快照原子替换：搜索/随机读到的要么是旧列表要么是新列表，无中间态
@@ -1128,9 +1133,19 @@ class ScpArticlePlugin(MaiBotPlugin):
     async def _send_text(self, text: str, stream_id: str) -> None:
         """发送普通文本（失败只记日志，不再抛异常打断命令流程）。"""
         try:
-            await self.ctx.send.text(text, stream_id)
+            if not self._delivery_ok(await self.ctx.send.text(text, stream_id)):
+                self.ctx.logger.error("普通文本投递失败")
         except Exception as e:
             self.ctx.logger.error("发送文本失败：%s", e)
+
+    async def _send_help(self, stream_id: str) -> None:
+        """帮助用单节点合并转发发送，投递失败时回退完整文本。"""
+        nodes = [{
+            "user_id": "0",
+            "nickname": str(self.config.render.forward_nickname or DEFAULT_FORWARD_NICKNAME),
+            "segments": [{"type": "text", "content": HELP_TEXT}],
+        }]
+        await self._send_forward_or_fallback(nodes, stream_id, HELP_TEXT)
 
     async def _send_forward_or_fallback(
         self, nodes: List[Dict[str, Any]], stream_id: str, fallback_text: str
@@ -1182,6 +1197,17 @@ class ScpArticlePlugin(MaiBotPlugin):
         """是否启用图片渲染发送（send_mode != "text" 时均视为图片模式）。"""
         return str(self.config.render.send_mode or DEFAULT_SEND_MODE).strip().lower() != "text"
 
+    @staticmethod
+    def _page_command(slug: str, page: int, *, text_mode: bool = False, force_lang: str = "") -> str:
+        """分页命令保留显示模式与语言，避免下一页切回默认图片/译文。"""
+        parts = ["/scp"]
+        if text_mode:
+            parts.append("text")
+        if force_lang == "en":
+            parts.append("en")
+        parts.extend([slug.removeprefix("scp-"), str(page)])
+        return " ".join(parts)
+
     def _build_report(
         self,
         title: str,
@@ -1192,6 +1218,7 @@ class ScpArticlePlugin(MaiBotPlugin):
         branch: str = "INT",
         site: str = "",
         note: str = "",
+        force_lang: str = "",
     ) -> Tuple[List[Dict[str, Any]], bool, int]:
         """按分片策略构造文本模式的转发节点。
 
@@ -1220,7 +1247,7 @@ class ScpArticlePlugin(MaiBotPlugin):
 
         footer: List[str] = []
         if truncated:
-            footer.append(f"读取后续分页：/scp {slug.replace('scp-', '', 1)} {page + 2}")
+            footer.append(f"读取后续分页：{self._page_command(slug, page + 2, text_mode=True, force_lang=force_lang)}")
             footer.append(f"本条目共 {total_pages} 页（每页 {max_nodes} 段）")
         if note:
             footer.append(note)
@@ -1250,6 +1277,7 @@ class ScpArticlePlugin(MaiBotPlugin):
         slug: str,
         page: int,
         source_lines: Sequence[str] = (),
+        *, force_lang: str = "",
     ) -> bool:
         """图片模式：把正文渲染为若干张带官方页头的图片并发送。
 
@@ -1303,7 +1331,7 @@ class ScpArticlePlugin(MaiBotPlugin):
         cmd_num = slug.replace("scp-", "", 1)
         last_footer: List[str] = []
         if truncated:
-            last_footer.append(f"内容较长，读取后续分页：/scp {cmd_num} {page + 2}")
+            last_footer.append(f"内容较长，读取后续分页：{self._page_command(slug, page + 2, force_lang=force_lang)}")
 
         font_scale = min(3.0, max(0.5, float(self.config.render.font_scale or DEFAULT_FONT_SCALE)))
 
@@ -1317,7 +1345,7 @@ class ScpArticlePlugin(MaiBotPlugin):
                     title=title,
                     body=chunk,
                     page_index=start + i + 1,
-                    total_pages=total_pages,
+                    total_pages=len(slices),
                     source_lines=source_lines,
                     logo_data_uri=logo_uri,
                     bg_data_uri=bg_uri,
@@ -1379,7 +1407,7 @@ class ScpArticlePlugin(MaiBotPlugin):
                 title=title,
                 body=window[index],
                 page_index=start + index + 1,
-                total_pages=total_pages,
+                total_pages=len(slices),
                 source_lines=source_lines,
                 logo_data_uri=logo_uri,
                 bg_data_uri=bg_uri,
@@ -1409,18 +1437,19 @@ class ScpArticlePlugin(MaiBotPlugin):
             }
             for b64 in images
         ]
-        try:
-            resp = await self.ctx.send.forward(nodes, stream_id, return_details=True)
-        except TypeError:
-            # 旧版 SDK 不支持 return_details 形参
+        resp = None
+        forward_attempted = payload <= MAX_FORWARD_PAYLOAD
+        if forward_attempted:
             try:
-                resp = await self.ctx.send.forward(nodes, stream_id)
+                resp = await self.ctx.send.forward(nodes, stream_id, return_details=True)
+            except TypeError:
+                # 旧版 SDK 不支持 return_details 形参
+                try:
+                    resp = await self.ctx.send.forward(nodes, stream_id)
+                except Exception as e:
+                    self.ctx.logger.warning("图片合并转发调用失败：%s", e)
             except Exception as e:
-                resp = None
                 self.ctx.logger.warning("图片合并转发调用失败：%s", e)
-        except Exception as e:
-            self.ctx.logger.warning("图片合并转发调用失败：%s", e)
-            resp = None
         forward_ok = self._delivery_ok(resp)
         if isinstance(resp, dict) and not forward_ok:
             self.ctx.logger.debug("合并转发投递详情：%s", resp)
@@ -1436,16 +1465,21 @@ class ScpArticlePlugin(MaiBotPlugin):
         # 合并转发投递失败（Platform IO 返回 FAILED，多为大消息超时假阴性——
         # 消息可能仍会迟到送达）。等待 FORWARD_FALLBACK_DELAY 秒再逐张回退，
         # 错开迟到送达，避免用户收到重复内容。
-        self.ctx.logger.warning(
-            "图片合并转发投递失败（负载约 %.1f MB），%.0f 秒后改为逐张发送"
-            "（若合并转发延迟送达，请忽略后续重复图片）",
-            payload / 1048576, FORWARD_FALLBACK_DELAY,
-        )
-        await asyncio.sleep(FORWARD_FALLBACK_DELAY)
+        if forward_attempted:
+            self.ctx.logger.warning(
+                "图片合并转发投递失败（负载约 %.1f MB），%.0f 秒后改为逐张发送"
+                "（若合并转发延迟送达，请忽略后续重复图片）",
+                payload / 1048576, FORWARD_FALLBACK_DELAY,
+            )
+            await asyncio.sleep(FORWARD_FALLBACK_DELAY)
+        else:
+            self.ctx.logger.warning("图片负载仍超出合并转发上限（约 %.1f MB），直接逐张发送", payload / 1048576)
         delivered = 0
         for i, b64 in enumerate(images):
-            b64 = await render_single_b64(i, b64)
             try:
+                b64 = await render_single_b64(i, b64)
+                if len(b64) > MAX_SINGLE_IMAGE_PAYLOAD:
+                    raise ValueError("图片重渲染后仍超过单张发送上限")
                 sent_i = await self.ctx.send.image(b64, stream_id)
             except Exception as e:
                 self.ctx.logger.warning("第 %d/%d 张图片发送异常：%s", i + 1, len(images), e)
@@ -1457,7 +1491,7 @@ class ScpArticlePlugin(MaiBotPlugin):
                 # 用户可用分页命令重看缺失页
                 self.ctx.logger.warning(
                     "第 %d/%d 张图片发送失败（可能被平台限流），可用 /scp %s %d 重看该页",
-                    i + 1, len(images), cmd_num, i + 1,
+                    i + 1, len(images), cmd_num, page + 1,
                 )
             if i < len(images) - 1:
                 await asyncio.sleep(PER_IMAGE_INTERVAL)
@@ -1468,8 +1502,8 @@ class ScpArticlePlugin(MaiBotPlugin):
                 "图片仅部分送达（%d/%d），不追加文字版以避免内容重复", delivered, len(images),
             )
             await self._send_text(
-                f"⚠️ 有 {len(images) - delivered} 张图片发送失败，"
-                f"可回复 /scp {cmd_num} {page + 1} 重新查看本页",
+                f"有 {len(images) - delivered} 张图片发送失败，"
+                f"可回复 {self._page_command(slug, page + 1, force_lang=force_lang)} 重新查看本页",
                 stream_id,
             )
         self.ctx.logger.info(
@@ -1577,7 +1611,7 @@ class ScpArticlePlugin(MaiBotPlugin):
         if not text_mode and self._image_mode_enabled():
             try:
                 if await self._send_article_images(
-                    stream_id, branch, title, body, slug, page, source_lines
+                    stream_id, branch, title, body, slug, page, source_lines, force_lang=force_lang
                 ):
                     return True, f"已返回《{title}》（图片）", 2
                 self.ctx.logger.warning("图片渲染无内容可发，回退为文本转发")
@@ -1585,7 +1619,7 @@ class ScpArticlePlugin(MaiBotPlugin):
                 self.ctx.logger.warning("图片渲染/发送失败，回退为文本转发：%s", e)
 
         nodes, truncated, total_pages = self._build_report(
-            title, body, slug, page, branch=branch, site=chosen_site
+            title, body, slug, page, branch=branch, site=chosen_site, force_lang=force_lang
         )
         if not nodes:
             await self._send_text(f"《{title}》正文为空。", stream_id)
@@ -1696,7 +1730,7 @@ class ScpArticlePlugin(MaiBotPlugin):
         if not pool:
             label = BRANCH_LABELS.get(branch, branch)
             await self._send_text(
-                f"本地目录中没有{label}的条目，可先执行 /scp刷新目录。", stream_id
+                f"本地目录中没有{label}的条目，可先执行 /scp refresh。", stream_id
             )
             return False, "目录无该分部", 2
 
@@ -1708,7 +1742,7 @@ class ScpArticlePlugin(MaiBotPlugin):
         # 纵深防御：目录可能来自旧版本写入的 catalog.json（未经新过滤）
         if not is_safe_slug(slug):
             await self._send_text(
-                "随机抽到的条目路径异常，已忽略。可执行 /scp刷新目录 重建目录后重试。",
+                "随机抽到的条目路径异常，已忽略。可执行 /scp refresh 重建目录后重试。",
                 stream_id,
             )
             return False, "目录条目路径异常", 2
@@ -1721,8 +1755,7 @@ class ScpArticlePlugin(MaiBotPlugin):
     @Command(
         "scp",
         description="查询 SCP 条目正文（/scp 国际站，/scp cn 中站；按编号 / 关键字 / 随机）",
-        pattern=r"(?<!\S)/?scp(?:\s+(?P<arg>.*?))?\s*$",
-        aliases=["scp查询"],
+        pattern=SCP_COMMAND_PATTERN,
     )
     async def cmd_scp(self, **kwargs: Any) -> Tuple[bool, str, int]:
         """`/scp` 指令入口。
@@ -1738,12 +1771,19 @@ class ScpArticlePlugin(MaiBotPlugin):
         - `/scp` / `/scp help`   → 帮助
         """
         stream_id = str(kwargs.get("stream_id") or "")
-        raw = str(kwargs.get("matched_groups", {}).get("arg") or "").strip()
+        # 执行入口复验原始命令文本，不信任其他调用方传入的 matched_groups。
+        match = re.fullmatch(SCP_COMMAND_PATTERN, str(kwargs.get("text") or ""))
+        if match is None:
+            return False, "", 0
+        raw = str(match.group("arg") or "").strip()
 
         # 无参数 / help → 帮助
         if not raw or raw.lower() in ("help", "?", "帮助"):
-            await self._send_text(HELP_TEXT, stream_id)
+            await self._send_help(stream_id)
             return True, "已返回帮助", 2
+
+        if raw.lower() in ("refresh", "刷新目录"):
+            return await self._handle_refresh_catalog(**kwargs)
 
         parts = raw.split()
 
@@ -1760,7 +1800,7 @@ class ScpArticlePlugin(MaiBotPlugin):
             else:
                 force_lang = "en"
         if not parts or parts[0].lower() in ("help", "?", "帮助"):
-            await self._send_text(HELP_TEXT, stream_id)
+            await self._send_help(stream_id)
             return True, "已返回帮助", 2
 
         head = parts[0]
@@ -1771,29 +1811,25 @@ class ScpArticlePlugin(MaiBotPlugin):
                 stream_id, branch, text_mode=text_mode, force_lang=force_lang
             )
 
-        # 「编号 + 页号」：第二个 token 为纯数字且第一个 token 能识别为编号
-        if len(parts) >= 2 and parts[1].isdigit() and normalize_code(head):
-            page = max(1, int(parts[1])) - 1
+        # 页号只接受长度有界的 ASCII 正整数；isdigit 还会接受 int 无法解析的 ²。
+        if normalize_code(head):
+            if len(parts) > 2 or (
+                len(parts) == 2 and (
+                    re.fullmatch(r"[0-9]{1,9}", parts[1]) is None or int(parts[1]) < 1
+                )
+            ):
+                await self._send_text("页号须为 1 至 999999999 的整数，如 /scp 096 2。", stream_id)
+                return False, "页号非法", 2
+            page = int(parts[1]) - 1 if len(parts) == 2 else 0
             return await self._handle_article(
                 stream_id, head, page, branch, text_mode=text_mode, force_lang=force_lang
-            )
-
-        # 能识别为编号 → 直取正文
-        if normalize_code(head):
-            return await self._handle_article(
-                stream_id, head, 0, branch, text_mode=text_mode, force_lang=force_lang
             )
 
         # 多词关键字 → 整体作为关键字
         return await self._handle_search(stream_id, " ".join(parts), branch)
 
-    @Command(
-        "scp刷新目录",
-        description="强制刷新 SCP 本地条目目录",
-        pattern=r"(?<!\S)/?scp刷新目录\s*$",
-    )
-    async def cmd_refresh_catalog(self, **kwargs: Any) -> Tuple[bool, str, int]:
-        """`/scp刷新目录`：强制重新抓取系列索引页构建条目目录。
+    async def _handle_refresh_catalog(self, **kwargs: Any) -> Tuple[bool, str, int]:
+        """`/scp refresh`：强制重新抓取系列索引页构建条目目录。
 
         带 per-stream 冷却（catalog.refresh_cooldown_minutes，默认 10 分钟，
         仅**成功**后落全量冷却）：一次刷新要抓 15 个索引页、约 20 秒，无冷却会
@@ -1807,36 +1843,35 @@ class ScpArticlePlugin(MaiBotPlugin):
         if not self.config.fetch.fetch_enabled:
             await self._send_text("插件已关闭联网抓取，无法刷新目录。", stream_id)
             return False, "联网抓取已关闭", 2
-        cooldown = max(0, int(self.config.catalog.refresh_cooldown_minutes or 10)) * 60
-        fail_cd = max(0, int(self.config.catalog.refresh_fail_cooldown_seconds or 60))
-        now = time.time()
-        remaining = int(cooldown - (now - self._refresh_ts.get(stream_id, 0.0)))
+        cooldown = max(0, int(self.config.catalog.refresh_cooldown_minutes)) * 60
+        fail_cd = max(0, int(self.config.catalog.refresh_fail_cooldown_seconds))
+        now = time.monotonic()
+        remaining = max(0, self._refresh_ts.get(stream_id, 0.0) - now)
         if remaining > 0:
             # 冷却中：仅当开关打开且触发者确实是管理员时放行（避免每次冷却期都白读一遍配置）
             bypass = False
             if self.config.admins.admin_bypass_refresh_cooldown:
                 bypass = await self._is_admin(kwargs)
             if not bypass:
-                minutes = max(1, (remaining + 59) // 60)
+                minutes = max(1, int((remaining + 59) // 60))
                 await self._send_text(
                     f"刷新太频繁（每 {cooldown // 60 or 1} 分钟一次），"
                     f"请约 {minutes} 分钟后再试（防止 SCP 维基限流/封 IP）。",
                     stream_id,
                 )
                 return False, "刷新冷却中", 2
-        # 先落全量冷却戳防连发；失败时回拨为短暂冷却（0.3.3 前失败也吃全量冷却）
-        self._refresh_ts[stream_id] = now
+        # 先设截止时间防连发；结束后从完成时刻起计算成功/失败冷却。
+        self._refresh_ts[stream_id] = now + cooldown
         # 顺带清理过期的冷却键（L5：长驻进程缓慢累积）
-        for key in [k for k, ts in self._refresh_ts.items()
-                    if now - ts > max(cooldown, fail_cd, 60) * 2]:
+        for key in [k for k, deadline in self._refresh_ts.items() if deadline <= now]:
             del self._refresh_ts[key]
         await self._send_text("正在刷新 SCP 条目目录（约需 20 秒）…", stream_id)
         ok, err = await self._ensure_catalog(force=True)
         if not ok:
-            # 失败回拨时间戳，使剩余冷却 = refresh_fail_cooldown_seconds
-            self._refresh_ts[stream_id] = now - max(0.0, float(cooldown - fail_cd))
+            self._refresh_ts[stream_id] = time.monotonic() + fail_cd
             await self._send_text(f"刷新失败：{err}", stream_id)
             return False, err or "刷新失败", 2
+        self._refresh_ts[stream_id] = time.monotonic() + cooldown
         await self._send_text(f"目录刷新完成，当前共 {len(self._catalog)} 条。", stream_id)
         return True, "目录已刷新", 2
 

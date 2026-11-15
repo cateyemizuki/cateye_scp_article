@@ -10,6 +10,8 @@
 - 指令 `/scp [cn] <关键字>` 在**本地条目目录**（约 1.1 万条，编号 + 标题）中按分部搜索；
 - 指令 `/scp [cn] rand` 从对应分部随机抽一篇；
 - **不注册任何 LLM 工具**：仅提供文本指令（按需求「暂时不要注册工具给 llm 调用」）。
+- **命令严格匹配**：只注册 `/scp`，须从消息开头完整匹配；裸 `scp`、`/sc`、
+  `/scp查询`、句中提及和多行引用均不触发本插件。帮助以单节点合并转发发送。
 
 ## 功能特性
 
@@ -46,7 +48,8 @@
   - 超出部分**截断**，卡末追加说明节点（总字数 / 已展示段数 / 原页面链接 / 分页命令），
     实测 6.9 万字条目分 3 页可 100% 覆盖全文。
 - **纯 ASCII 编号容错**：`173`、`scp-173`、`SCP-173`、`cn2000`、`SCP-CN-2000`、
-  `cn-2000`、`/scp cn 2000` 均可识别。
+  `cn-2000`、`/scp cn 2000` 均可识别。不足三位自动补零：`1` → `001`、`96` → `096`，
+  中站同样适用；四位及以上编号保持原样。
 - **本地条目目录**：抓取中站 15 个系列索引页（`/scp-series*`、`/scp-series-cn*`）解析出
   **11,476 条**（SCP-CN 4,434 / 国际 7,042，国际条目标题为中站中文译名），
   带磁盘缓存（默认 7 天），使搜索与随机**不依赖 wikidot 的 JS 搜索**。
@@ -60,8 +63,9 @@
 2. 重启 MaiBot，或在 WebUI 插件中心安装。
 3. 插件依赖 `httpx`，已声明于 `_manifest.json`，Host 会自动安装。
 
-> 兼容性声明：`host_application` `1.0.0 ~ 1.99.99`，`sdk` `2.5.0 ~ 2.99.99`（Manifest v2）。
-> 图片渲染依赖宿主 `render.html2png` 能力（MaiBot 1.2.x 实测支持）；宿主不支持时自动回退文本模式。
+> 0.3.5 兼容性声明：MaiBot `1.3.19 ~ 1.3.99`，SDK `2.20.0 ~ 2.20.99`（Manifest v2）。
+> 验证基线为 MaiBot `1.3.19` + SDK `2.20.0`；更早版本未在本次验证范围内。
+> 图片渲染依赖宿主 `render.html2png` 能力；渲染失败时自动回退文本模式。
 
 ## 使用方式
 
@@ -77,8 +81,10 @@
 | `/scp cn 门` | 在中站条目中按关键字搜索 |
 | `/scp rand` | 随机抽一篇国际站条目 |
 | `/scp cn rand` | 随机抽一篇中站条目 |
-| `/scp` / `/scp help` | 显示帮助 |
-| `/scp刷新目录` | 强制刷新本地条目目录（约 20 秒；同一聊天流 10 分钟冷却，管理员免冷却） |
+| `/scp` / `/scp help` | 单节点合并转发帮助，投递失败回退完整文本 |
+| `/scp refresh` / `/scp 刷新目录` | 强制刷新本地条目目录（约 20 秒；同一聊天流 10 分钟冷却，管理员免冷却） |
+
+0.3.5 将原 `/scp刷新目录` 收进 `/scp` 根命令；请改用 `/scp refresh`。
 
 ## 配置说明
 
@@ -87,7 +93,7 @@
 ```toml
 [plugin]
 enabled = true
-config_version = "0.3.4"
+config_version = "0.3.5"
 
 [fetch]                # 抓取配置
 site_url_int = "https://scp-wiki.wikidot.com"      # 国际站地址（/scp 查询）
@@ -112,12 +118,12 @@ show_source = true     # 是否显示原页面链接
 catalog_cache_hours = 168  # 本地目录缓存有效期（小时）
 search_limit = 10          # 搜索返回条数上限
 auto_refresh = true        # 目录缺失/超期时是否自动抓取
-refresh_cooldown_minutes = 10           # /scp刷新目录 成功后的 per-stream 冷却（分钟）
-refresh_fail_cooldown_seconds = 60      # /scp刷新目录 失败后的短暂冷却（秒）
+refresh_cooldown_minutes = 10           # /scp refresh 成功后的 per-stream 冷却（分钟）
+refresh_fail_cooldown_seconds = 60      # /scp refresh 失败后的短暂冷却（秒）
 
 [admins]               # 管理员配置（与宿主 [plugin].permission 并集，自动去重）
 admin_users = []       # 插件侧管理员名单，支持 "123456" 或 "qq:123456"
-admin_bypass_refresh_cooldown = true  # 管理员免 /scp刷新目录 冷却
+admin_bypass_refresh_cooldown = true  # 管理员免 /scp refresh 冷却
 ```
 
 ### 关键配置项说明
@@ -133,9 +139,9 @@ admin_bypass_refresh_cooldown = true  # 管理员免 /scp刷新目录 冷却
 | `render.per_node_chars` | 1500 | 文本模式；中文 UTF-8 约 3 字节/字，1500 字 ≈ 4.5KB，QQ 单条消息安全区间 |
 | `render.max_nodes` | 20 | 文本模式；20 × 1500 = 3 万字，可覆盖约 95% 条目的全文 |
 | `fetch.fetch_enabled` | true | 关闭后仅保留目录搜索/随机（需已有目录缓存） |
-| `catalog.auto_refresh` | true | 关闭后不会自动联网构建目录，可用 `/scp刷新目录` 手动构建 |
+| `catalog.auto_refresh` | true | 关闭后不会自动联网构建目录，可用 `/scp refresh` 手动构建 |
 | `admins.admin_users` | [] | 插件侧管理员名单；与宿主 `[plugin].permission` 合并为并集（按剥平台前缀后的纯 ID 去重，宿主 `qq:10001` 与配置 `10001` 算同一人）。本地控制台天然是管理员 |
-| `admins.admin_bypass_refresh_cooldown` | true | 管理员执行 `/scp刷新目录` 不受 10 分钟冷却 |
+| `admins.admin_bypass_refresh_cooldown` | true | 管理员执行 `/scp refresh` 不受 10 分钟冷却 |
 
 ### 安全约束（0.3.0 ~ 0.3.3）
 
@@ -159,7 +165,7 @@ admin_bypass_refresh_cooldown = true  # 管理员免 /scp刷新目录 冷却
 - **PNG 解压输出上限（0.3.3）**：页头底纹裁剪解码 PNG 时分块解压并限制累计输出
   （与声明像素上限 `MAX_PNG_PIXELS` 关联），高压缩比 IDAT 的解压炸弹不再能一次性
   吃满进程内存。
-- **目录刷新冷却**：`/scp刷新目录` **成功后**同一聊天流 10 分钟一次
+- **目录刷新冷却**：`/scp refresh` **成功后**同一聊天流 10 分钟一次
   （`catalog.refresh_cooldown_minutes` 可调；一次 15 个索引页、约 20 秒，防止群成员
   连发导致 SCP 维基限流/封宿主 IP）；**失败只短暂冷却 60 秒**
   （`catalog.refresh_fail_cooldown_seconds` 可调），网络抖动后可尽快重试。管理员
