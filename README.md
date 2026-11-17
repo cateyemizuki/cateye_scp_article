@@ -1,274 +1,216 @@
 # SCP 条目查询（MaiBot 插件）
 
-为麦麦（MaiBot）框架提供的 SCP 基金会条目查询插件：
+为麦麦（MaiBot）提供的 SCP 基金会维基条目查询插件。用户在聊天中发送 `/scp` 指令，即可按国际站或中站查询条目正文、按编号或标题搜索、随机抽选条目。正文默认连同对应分部的官方 Sigma-9 页头渲染为图片，并以一张合并转发卡发出；渲染失败或图片全部投递失败时回退为文本转发，文本转发再失败则回退普通文本。
 
-- **分站路由**：`/scp <编号>` 查询**国际站**条目，`/scp cn <编号>` 查询**中站**条目；
-- 文章默认**渲染为图片**发送：抓取对应分部**官方页头**（Sigma-9 主题的 logo 与横幅底纹）
-  内嵌 HTML，经宿主 `render.html2png` 渲染、`send.image` 发送，还原官方页面观感；
-- 渲染/发送失败**自动回退**文本合并转发（正文按段落装箱后用**单卡多节点**发送）；
-- 长文自动**分页**（图片按张、文本按节点），卡末提示字数、已展示范围、原页面链接与分页命令；
-- 指令 `/scp [cn] <关键字>` 在**本地条目目录**（约 1.1 万条，编号 + 标题）中按分部搜索；
-- 指令 `/scp [cn] rand` 从对应分部随机抽一篇；
-- **不注册任何 LLM 工具**：仅提供文本指令（按需求「暂时不要注册工具给 llm 调用」）。
-- **命令严格匹配**：只注册 `/scp`，须从消息开头完整匹配；裸 `scp`、`/sc`、
-  `/scp查询`、句中提及和多行引用均不触发本插件。帮助以单节点合并转发发送。
+- `/scp <编号>` 查询国际站，`/scp cn <编号>` 查询中站；国际站条目默认优先显示中站同 slug 译文，`/scp en` 可强制英文原文。
+- `/scp [cn] <关键字>` 在本地「编号 + 标题」目录中搜索，`/scp [cn] rand` 从对应分部随机抽选。
+- 长文按页截断，图片页脚或文本卡末会给出继续读取的分页命令。
+- 只注册 `/scp` 一条聊天命令，不注册 LLM 工具，也没有 Hook；所有输出都由用户指令触发。
 
-## 功能特性
+## 安装与启用
 
-- **分站路由**：
-  - `/scp 173` → 国际站条目 `https://scp-wiki.wikidot.com/scp-173`；
-  - `/scp cn 2000` → 中站条目 `https://scp-wiki-cn.wikidot.com/scp-cn-2000`；
-  - 编号自带 cn 标记（`/scp cn-2000`）时自动路由到中站；
-  - 搜索与随机按分部过滤；本分部无结果而另一分部有相关条目时给出跨分部提示。
-- **国际站条目显示中文译文**（`fetch.int_content_zh`，默认开启）：
-  - `/scp 173` 的内容取自**中站同 slug 译文页**，页头仍为国际站官方头；
-  - 无译文的条目自动回退英文原文；页脚同时标注「原文 / 译文」链接；
-  - `/scp en <编号>` 单次强制英文原文。
-- **图片渲染发送**（默认，`render.send_mode = "image"`；`/scp text` 可单次改用文字版）：
-  - 官方页头：国际站 logo 取自 `cdn.scpwiki.com`（Sigma-9 主题）、中站取自
-    `sigma9.scpwikicn.com`（Sigma-9 中文主题），横幅底纹（整页背景图）**自动裁剪出暗色页头带**
-    后连同 logo 以 data URI 内嵌，经宿主 `render.html2png`（禁网安全渲染）出图后发送；
-  - 页头资源四级取用（内存 → 磁盘 7 天 → 联网下载 → **内置兜底**）：本机旧缓存
-    （哪怕过期）优先，内置兜底（随插件发布的 `assets/header_INT.json` /
-    `assets/header_CN.json`，内容为开发期抓到的官方页头渲染）只在**完全没有任何资源**时
-    顶上；两者都没有才退化为纯色横幅 + 文字徽标。因此离线部署或首启即遇 CDN 故障
-    也能出带官方页头的图；
-  - 长文按段落装箱切为「图片页」（每张约 5000 字，宽 900px 高度自适应），
-    单次最多 3 张，**图片统一以单张合并转发卡发出（单图也入卡）**，
-    投递失败回退逐张发送，超出截断并给出分页命令；
-    `/scp <编号> <页号>` 读取后续图片页；
-  - 分段为**智能切分**：超长段落按句子边界（其次子句边界）切开，不拦腰截断；
-    末页碎片自动并入前一页，避免孤行页；
-  - **字号可调**（`render.font_scale`，默认 1.5 → 正文 24px），手机阅读更清晰；
-  - 页脚含页码、原页面链接与 CC BY-SA 3.0 授权声明。
-- **文本模式兜底**（`render.send_mode = "text"` 或渲染失败时）：
-  - 正文按**段落**装箱切分（不撕裂句子/表格），每节点不超过 `per_node_chars`（默认 1500 字），
-    单卡节点数不超过 `max_nodes`（默认 20），每节点只含**一个 text 段**
-    （符合文档对 `send.forward` 的建议）；
-  - 超出部分**截断**，卡末追加说明节点（总字数 / 已展示段数 / 原页面链接 / 分页命令），
-    实测 6.9 万字条目分 3 页可 100% 覆盖全文。
-- **纯 ASCII 编号容错**：`173`、`scp-173`、`SCP-173`、`cn2000`、`SCP-CN-2000`、
-  `cn-2000`、`/scp cn 2000` 均可识别。不足三位自动补零：`1` → `001`、`96` → `096`，
-  中站同样适用；四位及以上编号保持原样。
-- **本地条目目录**：抓取中站 15 个系列索引页（`/scp-series*`、`/scp-series-cn*`）解析出
-  **11,476 条**（SCP-CN 4,434 / 国际 7,042，国际条目标题为中站中文译名），
-  带磁盘缓存（默认 7 天），使搜索与随机**不依赖 wikidot 的 JS 搜索**。
-- **回退机制**：图片渲染失败 → 文本合并转发 → 普通文本，逐级兜底不空手。
-- **离线可用**：`fetch.fetch_enabled = false` 时关闭联网，仅保留目录搜索与随机
-  （此时图片模式的页头走本机缓存 → 内置兜底资源，仍能出图）。
-
-## 安装方式
-
-1. 将本插件目录（含 `_manifest.json`、`plugin.py`、`scp_core.py` 等）放入 MaiBot 的 `plugins/` 目录。
+1. 将整个插件目录放入 MaiBot 的 `plugins/`。运行所需文件包括 `_manifest.json`、`plugin.py`、`scp_core.py`、`url_guard.py`、`admin_util.py`；`assets/header_INT.json`、`assets/header_CN.json` 提供下载失败时的内置兜底页头。
 2. 重启 MaiBot，或在 WebUI 插件中心安装。
-3. 插件依赖 `httpx`，已声明于 `_manifest.json`，Host 会自动安装。
 
-> 0.3.5 兼容性声明：MaiBot `1.3.19 ~ 1.3.99`，SDK `2.20.0 ~ 2.20.99`（Manifest v2）。
-> 验证基线为 MaiBot `1.3.19` + SDK `2.20.0`；更早版本未在本次验证范围内。
-> 图片渲染依赖宿主 `render.html2png` 能力；渲染失败时自动回退文本模式。
-
-## 使用方式
-
-| 命令 | 说明 |
+| 项目 | 要求 |
 |---|---|
-| `/scp 173` | 查询国际站 SCP-173 正文（中文译文 + 国际站页头，图片） |
-| `/scp cn 2000` | 查询中站 SCP-CN-2000 正文（图片） |
-| `/scp 5000 2` | 读取国际站 SCP-5000 的第 2 页（超长条目） |
-| `/scp cn 3000 2` | 读取中站 SCP-CN-3000 的第 2 页 |
-| `/scp en 173` | 强制显示 SCP-173 英文原文 |
-| `/scp text 173` / `/scp text cn 2000` | 文字版（合并转发文本，不渲染图片） |
-| `/scp 深红之王` | 在国际站条目中按关键字搜索 |
-| `/scp cn 门` | 在中站条目中按关键字搜索 |
-| `/scp rand` | 随机抽一篇国际站条目 |
-| `/scp cn rand` | 随机抽一篇中站条目 |
-| `/scp` / `/scp help` | 单节点合并转发帮助，投递失败回退完整文本 |
-| `/scp refresh` / `/scp 刷新目录` | 强制刷新本地条目目录（约 20 秒；同一聊天流 10 分钟冷却，管理员免冷却） |
+| 插件清单 | Manifest v2，id `github.cateye.scp-article`，version `0.3.5` |
+| 宿主 | MaiBot `1.3.19 ~ 1.3.99` |
+| SDK | `2.20.0 ~ 2.20.99` |
+| Python 依赖 | `httpx>=0.25.0`（已在 `_manifest.json` 声明） |
+| 宿主能力 | `send.text`、`send.forward`、`send.image`、`render.html2png`、`config.get`（读取宿主管理员名单） |
 
-0.3.5 将原 `/scp刷新目录` 收进 `/scp` 根命令；请改用 `/scp refresh`。
+`render.html2png` 只在图片模式使用，渲染失败会自动回退文本模式。页头 PNG/SVG 裁剪使用标准库 `struct`、`zlib`，不需要 Pillow。
 
-## 配置说明
+插件在宿主分配的插件数据目录中写入以下运行期文件：
 
-插件加载后由 Runner 在插件目录生成 `config.toml`，可在 WebUI 修改：
+- `catalog.json`：条目目录缓存（编号 + 标题）。
+- `header_assets_INT.json`、`header_assets_CN.json`：官方页头资源缓存（7 天有效）。
 
-```toml
-[plugin]
-enabled = true
-config_version = "0.3.5"
+随插件分发的 `assets/header_INT.json`、`assets/header_CN.json` 是内置兜底页头快照；快照缺失或格式不符时按无资源处理，页头最终可能降级为纯色横幅加文字徽标。
 
-[fetch]                # 抓取配置
-site_url_int = "https://scp-wiki.wikidot.com"      # 国际站地址（/scp 查询）
-site_url_cn = "https://scp-wiki-cn.wikidot.com"    # 中站地址（/scp cn 查询）
-int_content_zh = true    # 国际站条目优先显示中站译文（无译文回退原文）
-timeout = 20.0                                     # 单次 HTTP 请求超时（秒，上限 60）
-fetch_enabled = true                               # 是否允许联网抓取正文
+## 指令
 
-[render]               # 展示配置
-send_mode = "image"    # 发送方式：image=渲染图片；text=文本合并转发
-per_image_chars = 5000 # 图片模式：每张图片承载的正文汉字上限
-max_image_pages = 3    # 图片模式：单次最多发送的图片张数（上限 10）
-image_width = 900      # 图片模式：渲染图宽度（像素）
-render_scale = 1.0    # 图片模式：渲染缩放倍率（1.0 保证合并转发同步送达）
-font_scale = 1.5       # 图片模式：字号缩放倍率（1.0 基准正文 16px → 1.5 即 24px）
-per_node_chars = 1500  # 文本模式：每个转发节点的字符上限
-max_nodes = 20         # 文本模式：单张转发卡的最大节点数
-forward_nickname = "SCP 基金会档案"  # 文本模式：转发气泡昵称
-show_source = true     # 是否显示原页面链接
+只注册 `/scp` 根命令。命令必须从消息开头完整匹配整条单行消息，参数用空格或制表符分隔；裸 `scp`、`/sc`、`/scp查询`、句中提及和多行消息都不会触发。插件代码不校验查询命令的权限，唯一与身份相关的逻辑是刷新冷却的管理员豁免。
 
-[catalog]              # 目录配置
-catalog_cache_hours = 168  # 本地目录缓存有效期（小时）
-search_limit = 10          # 搜索返回条数上限
-auto_refresh = true        # 目录缺失/超期时是否自动抓取
-refresh_cooldown_minutes = 10           # /scp refresh 成功后的 per-stream 冷却（分钟）
-refresh_fail_cooldown_seconds = 60      # /scp refresh 失败后的短暂冷却（秒）
+修饰符写在编号或关键字前，顺序任意、可组合；英文修饰符不区分大小写：
 
-[admins]               # 管理员配置（与宿主 [plugin].permission 并集，自动去重）
-admin_users = []       # 插件侧管理员名单，支持 "123456" 或 "qq:123456"
-admin_bypass_refresh_cooldown = true  # 管理员免 /scp refresh 冷却
-```
+| 修饰符 | 作用 |
+|---|---|
+| `text` / `文字` / `文本` | 文字版，跳过图片渲染 |
+| `cn` / `中文` / `中站` / `cn站` | 查询中站 |
+| `en` / `英文` / `原文` | 强制英文原文 |
 
-### 关键配置项说明
-
-| 配置项 | 默认值 | 说明 |
+| 命令 | 说明 | 示例 |
 |---|---|---|
-| `render.send_mode` | image | image=图片发送（带官方页头，多图合并转发）；text=文本合并转发。渲染失败自动回退 |
-| `fetch.int_content_zh` | true | 国际站条目优先显示中站译文；`/scp en` 可单次强制原文 |
-| `render.max_image_pages` | 3 | 单次最多 3 张图（约 1.5 万字），覆盖约 95% 条目全文 |
-| `render.image_width` | 900 | 渲染图宽度；高度按内容自适应 |
-| `render.render_scale` | 1.0 | 渲染缩放倍率；1.0 保证大图合并转发同步送达（0.2.3 前的 image_scale 已更名） |
-| `render.font_scale` | 1.5 | 字号缩放倍率（正文 16px 基准），默认正文 24px |
-| `render.per_node_chars` | 1500 | 文本模式；中文 UTF-8 约 3 字节/字，1500 字 ≈ 4.5KB，QQ 单条消息安全区间 |
-| `render.max_nodes` | 20 | 文本模式；20 × 1500 = 3 万字，可覆盖约 95% 条目的全文 |
-| `fetch.fetch_enabled` | true | 关闭后仅保留目录搜索/随机（需已有目录缓存） |
-| `catalog.auto_refresh` | true | 关闭后不会自动联网构建目录，可用 `/scp refresh` 手动构建 |
-| `admins.admin_users` | [] | 插件侧管理员名单；与宿主 `[plugin].permission` 合并为并集（按剥平台前缀后的纯 ID 去重，宿主 `qq:10001` 与配置 `10001` 算同一人）。本地控制台天然是管理员 |
-| `admins.admin_bypass_refresh_cooldown` | true | 管理员执行 `/scp refresh` 不受 10 分钟冷却 |
+| `/scp`、`/scp help`、`/scp ?`、`/scp 帮助` | 帮助。以单节点合并转发发送，投递失败时改发完整文本 | `/scp help` |
+| `/scp <编号> [页号]` | 查询国际站条目；编号自带 cn 标记时改走中站。默认先取中站同 slug 译文，无译文回退英文原文，页头跟随分部 | `/scp 173`、`/scp 5000 2` |
+| `/scp cn <编号> [页号]` | 查询中站条目；纯数字编号强制归入 `scp-cn-<号>` | `/scp cn 2000`、`/scp cn-2000` |
+| `/scp en <编号> [页号]` | 强制英文原文。`cn` 分部先查国际站同 slug，未命中再回退中站；其他分部只查国际站 | `/scp en 173`、`/scp en cn 2000` |
+| `/scp text <编号> [页号]` | 文字版合并转发；`text` 可与 `cn`、`en` 组合 | `/scp text 173`、`/scp text cn 2000` |
+| `/scp [cn] <关键字>` | 在对应分部的本地目录中搜索编号与标题，多词关键字整体匹配 | `/scp 深红之王`、`/scp cn 门` |
+| `/scp [cn] rand` | 从对应分部目录随机抽一条并查询正文；别名 `random`、`随机` | `/scp rand`、`/scp cn 随机` |
+| `/scp refresh` | 重新抓取中站的 15 个系列索引页构建目录，约 20 秒；失败时保留旧目录并回复原因。也可写 `/scp 刷新目录` | `/scp refresh` |
 
-### 安全约束（0.3.0 ~ 0.3.3）
+旧写法 `/scp刷新目录`、`/scp查询` 不再触发；刷新请用 `/scp refresh` 或 `/scp 刷新目录`。
 
-- **站点地址白名单**：`fetch.site_url_int` / `site_url_cn` 只接受 **https + 官方两个
-  wikidot 域名**（`scp-wiki.wikidot.com` / `scp-wiki-cn.wikidot.com`）。填内网/环回/
-  元数据地址（`127.0.0.1`、`192.168.x.x`、`169.254.169.254` 等）、非 http(s) scheme 或
-  白名单外域名都会记告警并回退默认站——配置入口不会被用来把内部服务响应回显进群聊。
-- **重定向逐跳复验（0.3.3）**：抓取不再由 httpx 自动跟随重定向，改为手动逐跳跟随
-  （上限 5 跳），每跳经统一护栏（`url_guard.py`，随插件分发）复验 https scheme、
-  host 白名单与 DNS 解析结果（不落内网/元数据段）——白名单域被劫持或开放重定向时
-  也不会把内网响应抓回群聊。页面限官方 wikidot 域，页头资源限官方 CDN 域
-  （`cdn.scpwiki.com` / `sigma9.scpwikicn.com`）。
-- **slug 严格形态**：条目 slug 一律须为 ASCII 小写字母数字与连字符（≤128 字符），
-  目录解析、编号解析、请求拼接三处都校验，百分号编码、`..`、`//`、尾随斜杠等畸形路径
-  都进不了请求 URL。
-- **抓取体积上限**：正文 HTML 5MB / 页头资源 4MB，流式读取，先查 `Content-Length`
-  再逐块累计，超限立即中止。
-- **页头资源 data URI 白名单（0.3.3）**：磁盘缓存 / 内置快照中的 logo 与底纹 URI
-  注入渲染 HTML 前须匹配 `data:image/(png|svg+xml);base64,<base64>` 形态且长度合理，
-  不合法按资源缺失处理走兜底链，杜绝本地缓存文件被篡改后的 HTML/CSS 注入。
-- **PNG 解压输出上限（0.3.3）**：页头底纹裁剪解码 PNG 时分块解压并限制累计输出
-  （与声明像素上限 `MAX_PNG_PIXELS` 关联），高压缩比 IDAT 的解压炸弹不再能一次性
-  吃满进程内存。
-- **目录刷新冷却**：`/scp refresh` **成功后**同一聊天流 10 分钟一次
-  （`catalog.refresh_cooldown_minutes` 可调；一次 15 个索引页、约 20 秒，防止群成员
-  连发导致 SCP 维基限流/封宿主 IP）；**失败只短暂冷却 60 秒**
-  （`catalog.refresh_fail_cooldown_seconds` 可调），网络抖动后可尽快重试。管理员
-  （宿主 `[plugin].permission` ∪ 插件配置 `admins.admin_users`，去重后）默认免冷却，
-  可用 `admins.admin_bypass_refresh_cooldown` 关闭。刷新期间搜索/随机用旧目录继续
-  应答，不再等待约 20 秒的重建。
-- **配置上界（0.3.3）**：`fetch.timeout` 运行时钳制 ≤ 60 秒、
-  `render.max_image_pages` 钳制 ≤ 10，防止配置侧自伤（拖死单请求 / 上千次渲染）。
+### 编号与页号
 
-> 从 0.1.x/0.2.0 升级：`fetch.site_url` 已拆分为 `site_url_int` / `site_url_cn`，
-> `render.cn_first` 已移除、新增 `fetch.int_content_zh` 与 `render.send_mode / per_image_chars /
-> max_image_pages / image_width / image_scale`；Runner 在 config_version 变化时会自动重建配置骨架。
-> 发送可靠性：`send.forward`（return_details）/ `send.image` 返回值逐级检查；投递失败先等待 8 秒
-> （Platform IO 对大消息可能「超时报失败但迟到送达」）再逐张回退，且部分送达后不补文字版，
-> 杜绝一条查询返回多份重复内容；仅当图片一张都没发出时才回退文字版。
+- 只识别 ASCII 数字。`173`、`scp-173`、`SCP-173` 均解析为 `scp-173`；`1`、`96` 补零为 `scp-001`、`scp-096`，中站同样适用，四位及以上编号保持原样。
+- `cn2000`、`cn-2000`、`SCP-CN-2000`、`scpcn2000` 以及 `/scp cn 2000` 均归入 `scp-cn-2000`。编号自带 `cn` 标记时，即使不加 `cn` 修饰符也会路由到中站。
+- 页号是 `1` 至 `999999999` 的 ASCII 整数。`0`、负数、非数字或编号后跟多个参数都会提示「页号须为 1 至 999999999 的整数」。
+- 页号按批次计：图片模式一页最多 `render.max_image_pages` 张图，文本模式一页最多 `render.max_nodes` 个节点。页号超过总页数时读取最后一页。自动生成的分页/重试命令会保留文字版与英文原文选项。
 
-## 长文本处理策略
+搜索只在对应分部的目录子集内进行；本分部无结果而另一分部有相关条目时，会列出最多 3 条并提示改用 `/scp cn <关键字>` 或 `/scp <关键字>`。编号非法、目录不可用、抓取失败（聚合两个站点的原因）、无匹配、正文为空等情况都以普通文本回复。
 
-SCP 条目正文字数差异极大（实测中位数 2,459 字，最长 69,191 字），核心矛盾是
-**单条消息 / 单张图片容量有限**而长尾文章远超之。本插件采用三层机制：
+## 配置
 
-| 层 | 机制（图片模式） | 机制（文本模式） | 目的 |
+插件配置位于插件目录的 `config.toml`，可在 WebUI 编辑。插件在处理指令时读取当前配置，`on_config_update` 仅记录日志；已有目录和页头缓存不会因配置变更自动清空。
+
+**`[fetch]` 抓取**
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `site_url_int` | `https://scp-wiki.wikidot.com` | `/scp` 使用的站点。只接受 https + 官方 wikidot 域名，非法值回退默认站 |
+| `site_url_cn` | `https://scp-wiki-cn.wikidot.com` | `/scp cn` 使用的站点，同时决定目录索引页的抓取站 |
+| `int_content_zh` | `true` | 国际站条目优先取中站同 slug 译文；关闭后只取国际站原文。`/scp en` 不受该字段影响 |
+| `timeout` | `20.0` | 单次 HTTP 超时（秒）；≤0 按 20 处理，最大 60 |
+| `fetch_enabled` | `true` | 是否允许联网抓取。关闭后正文查询、随机、目录刷新均不可用，只能搜索已有目录缓存 |
+
+**`[render]` 展示**
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `send_mode` | `image` | `image` 渲染图片，`text` 直接文本转发；除 `text` 外的值都按图片模式处理 |
+| `per_image_chars` | `5000` | 每张图片承载的正文上限，按段落装箱；运行时下限 1000 |
+| `max_image_pages` | `3` | 每个分页批次最多发送的图片张数；运行时限制 1~10 |
+| `image_width` | `900` | 渲染图宽度（像素），高度按内容自适应；运行时下限 400 |
+| `render_scale` | `1.0` | `device_scale_factor`，越大越清晰、图片体积越大；限制 1.0~3.0 |
+| `font_scale` | `1.5` | 字号倍率，基准正文 16px；默认 1.5 即 24px，限制 0.5~3.0 |
+| `per_node_chars` | `1500` | 文本模式每个转发节点的字符上限；运行时下限 200 |
+| `max_nodes` | `20` | 文本模式单张转发卡的最大节点数；运行时下限 1 |
+| `forward_nickname` | `SCP 基金会档案` | 帮助、文本转发和图片转发节点的昵称 |
+| `show_source` | `true` | 图片页脚和截断文本卡是否附原页面链接；图片页脚始终保留 CC BY-SA 3.0 声明 |
+
+**`[catalog]` 目录**
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `catalog_cache_hours` | `168` | 内存目录的有效期（小时）；过期后按 `auto_refresh` 决定是否重建 |
+| `search_limit` | `10` | 搜索结果条数上限；运行时下限 1 |
+| `auto_refresh` | `true` | 目录缺失或过期时是否自动联网构建。关闭后有旧目录就继续用，没有则提示手动 `/scp refresh` |
+| `refresh_cooldown_minutes` | `10` | 刷新成功后每个聊天流的冷却（分钟）；0 表示不冷却 |
+| `refresh_fail_cooldown_seconds` | `60` | 刷新失败后的冷却（秒）；0 表示不冷却 |
+
+**`[admins]` 管理员**
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `admin_users` | `[]` | 插件侧管理员，支持 `123456` 与 `qq:123456`；与宿主 `plugin.permission` 合并后按纯 ID 去重 |
+| `admin_bypass_refresh_cooldown` | `true` | 管理员是否跳过刷新冷却 |
+
+`[plugin]` 分组还包含 `enabled`（默认 `true`）与只读的 `config_version`（`0.3.5`，WebUI 中隐藏）；插件代码不读取这两个字段。
+
+几个开关的实际效果：
+
+- `fetch_enabled = false`：正文查询回复「插件已关闭联网抓取」，`/scp rand` 因最终要查询正文也不可用，`/scp refresh` 回复无法刷新；搜索仍可使用已有目录。
+- `auto_refresh = false`：不会自动联网构建目录；已有目录（即使已过期）继续用于搜索和随机，没有目录时提示执行 `/scp refresh`。`/scp refresh` 不受该字段限制，只要联网抓取开启就能强制重建。
+- `send_mode = text`：所有查询直接走文本合并转发，`render` 下的图片参数不再生效；其他值按图片模式处理。
+- 修改 `site_url_cn` 后，已有目录不会自动失效；可执行 `/scp refresh` 立即从新站点重建，否则等目录过期后按 `auto_refresh` 处理。目录刷新进行期间，搜索和随机直接读旧目录，不等待重建完成。
+
+管理员判定为宿主 `plugin.permission` ∪ `admins.admin_users`，按剥去平台前缀后的纯 ID 去重；本地控制台触发的操作直接视为管理员。该身份目前只用于 `/scp refresh` 的冷却豁免。
+
+## 长文本与发送
+
+正文抓取后先清理页面评分挂件、授权与引用标题等噪声行，再按空行分段；图片和文本模式共用同一套分片逻辑，单段超限时优先按句子边界、其次按子句边界切分，最后才硬切。
+
+| 模式 | 单页上限 | 单次发送上限 | 超出后 |
 |---|---|---|---|
-| 1 | 每张图 ≤ `per_image_chars` 字 | 单节点 ≤ `per_node_chars` | 控制单张图片高度 / 规避平台单消息上限 |
-| 2 | 单次 ≤ `max_image_pages` 张 | 单卡节点数 ≤ `max_nodes` | 控制消息数量 / 规避单卡节点数上限 |
-| 3 | 超出截断 + 图脚分页命令 | 超出截断 + 卡末提示 + 分页 | 明确告知用户「未完」，并给出继续读取的方式 |
+| 图片（默认） | 每张 `per_image_chars`，默认 5000 字 | `max_image_pages` 张，默认 3 张 | 截断，最后一张图脚给出分页命令 |
+| 文本 | 每节点 `per_node_chars`，默认 1500 字 | `max_nodes` 个节点，默认 20 个 | 截断，卡末追加说明节点与分页命令 |
 
-按段落装箱可保证**最长段落仅约 300 字**，因此切分几乎总在自然语义边界发生。
+默认参数下，图片模式一次约发送 1.5 万字，文本模式一页约 3 万字。
 
-超长条目图片页脚提示示例：
+**图片模式**
 
-```
-第 1 / 9 页
-原页面：https://scp-wiki-cn.wikidot.com/scp-cn-3000
-内容较长，读取后续分页：/scp cn-3000 2
-内容来自 SCP 基金会维基，依 CC BY-SA 3.0 授权
-```
+- 正文按段落装箱切成图片页，末页过短时并入前一页（允许小幅超出上限）。
+- 每张图使用对应分部的官方页头：国际站 logo 与底纹来自 `cdn.scpwiki.com`，中站来自 `sigma9.scpwikicn.com`；图片以 data URI 内嵌，经 `render.html2png` 按 `image_width`、`full_page=True`、`device_scale_factor=render_scale` 渲染。
+- 所有图片放进同一张合并转发卡，每个节点一张图；单张图片也入卡发送。有多张图时页脚显示图片序号，发生截断时最后一张图脚给出分页命令；来源链接由 `show_source` 控制，CC BY-SA 3.0 声明始终存在。分页命令中的页号按批次计，不是单张图片的序号。
+- 页头资源按「内存缓存 → 7 天内的磁盘缓存 → 联网下载 → 过期磁盘缓存 → 内置快照 → 纯色横幅加文字徽标」取用。下载失败按该顺序降级；裁剪遇到不支持的格式时原样使用。
+- **体积护栏**：所有图片的 base64 负载超过 10 MiB 时，若当前 `render_scale` 高于 1.0，先降到 1.0 重渲染；仍超限则把 `font_scale` 降到 1.0 再渲染；仍超限就跳过合并转发，直接逐张发送。单张超过 8 MiB 时，按当前状态降一档重渲染（优先把 `render_scale` 降到 1.0，已为 1.0 则把 `font_scale` 降到 1.0）；仍超限则不发这张图。
+- **投递回退**：尝试合并转发但投递失败后，先等待 8 秒（避免平台「超时返回失败但迟到送达」造成重复），再以 1 秒间隔逐张 `send.image`。部分图片失败时只发一条提示，让用户用分页命令重看，不补文字版；一张都没发出才回退文本模式。渲染失败或拿不到图像数据时同样回退文本模式。
+
+**文本模式**
+
+- 每个节点一个文本段。首节点顶部标注标题和页码/段数，节点之间用分隔线区分。
+- 发生截断时，卡末追加独立说明节点：本条消息的段数与约字数、正文总字数、原页面链接（`show_source` 开启时）、下一页命令和总页数。
+- 合并转发失败时改发一段普通文本，内容取自当前页的实质正文；发生截断时再附截断说明和原页面链接。
+- 帮助的合并转发同样使用该回退，失败时发送完整帮助文本。
+
+## 安全与网络边界
+
+插件只读抓取两个官方维基站点，不向站点写入内容。所有页面和页头资源请求都经过同一套出站护栏：
+
+- **站点配置白名单**：`fetch.site_url_int` 与 `site_url_cn` 只接受 `https://scp-wiki.wikidot.com` 和 `https://scp-wiki-cn.wikidot.com` 的根地址（默认 443 端口，根路径，无查询、片段或凭据）。内网、环回、元数据地址、非 https scheme 和白名单外域名都会记告警并回退默认站；告警只记录拒绝原因，不输出配置中的凭据。
+- **重定向逐跳复验**：不使用 httpx 自动跟随。初始地址和每个 `Location` 都先校验 https 与 host 白名单，再解析 DNS 检查结果，最多跟随 5 跳；相对跳转按当前地址解析后再校验。页面只允许官方 wikidot 域，页头资源只允许 `cdn.scpwiki.com` 与 `sigma9.scpwikicn.com`。
+- **DNS 黑名单**：解析结果命中 RFC1918 私网、CGNAT、环回、link-local（含 `169.254.169.254`）、保留段、组播段及对应 IPv6 段时拒绝请求。
+- **slug 白名单**：条目 slug 必须匹配 `^[a-z0-9]+(?:-[a-z0-9]+)*$` 且不超过 128 字符；目录解析、请求拼接和随机抽取三处都校验。编号解析只认 ASCII 数字，全角数字不会被当成编号。
+- **目录条目过滤**：索引页里的 href 只接受同源相对路径，拒绝绝对 URL、协议相对路径、`..`、`//`、`:`、`?`、`#`、反斜杠和非 ASCII slug。
+- **响应体上限**：正文 HTML 最大 5 MB，页头资源最大 4 MB；先检查 `Content-Length`，再流式读取并累计，超限立即中止。
+- **页头资源注入**：磁盘缓存和内置快照中的 logo、底纹必须是 `data:image/png` 或 `data:image/svg+xml` 的纯 base64 data URI，且有长度上限；不合法按资源缺失处理，避免缓存文件被篡改后注入渲染 HTML。
+- **PNG/SVG 裁剪**：PNG 只处理 8 位非隔行 RGB/RGBA/灰度图，像素总数上限 1600 万，解压输出按合法行尺寸设限并拒绝截断流、零尺寸和非法滤波类型；SVG 只改写 `viewBox` 和根标签的 `height`。不支持的格式原样使用。
+- **刷新限频**：`/scp refresh` 一次抓取 15 个索引页，按聊天流冷却（默认成功 10 分钟、失败 60 秒），防止连发触发站点限流。
+
+正文与标题在进入渲染 HTML 前做 HTML 转义；渲染所需图片全部以 data URI 内嵌。
+
+## 数据来源与授权
+
+条目正文与页头素材来自 SCP 基金会维基：
+
+- 国际站 <https://scp-wiki.wikidot.com>。页头 logo 与底纹来自 `cdn.scpwiki.com` 的 Sigma 主题（原 Sigma-9 主题设计：Aelanna）。
+- 中站 <https://scp-wiki-cn.wikidot.com>。页头素材来自 `sigma9.scpwikicn.com` 的 Sigma-9 中文主题。
+- 底纹原图为 100×400 的整页背景，插件裁剪顶部 164 行作为页头暗色带，并以 base64 data URI 内嵌。这是对素材的修改，逐项署名与修改说明见 [NOTICE.md](NOTICE.md)。
+
+条目正文、标题与上述图片资源依 **CC BY-SA 3.0** 使用。渲染图页脚固定输出「内容来自 SCP 基金会维基，依 CC BY-SA 3.0 授权」；`render.show_source` 开启时附来源链接，使用译文时同时列出原文与译文。文本卡在截断提示中附原页面链接。
+
+插件只做只读抓取与即时展示，不缓存或转载正文；磁盘缓存只保存「编号 + 标题」目录和页头图片资源。插件不含 SCP-173 的旧配图（Izumi Kato 的 *Untitled 2004*，不在 CC 授权范围内），只抓取页面文本。
+
+## 已知限制
+
+- 搜索只覆盖本地目录中的编号与标题，不搜正文。wikidot 的全文搜索依赖 JS，服务端无法直接调用。
+- 目录来自中站 15 个系列索引页（国际 10 页、中站 5 页）。未收录的条目仍可按编号直接查询，但不会出现在搜索和随机中；单个索引页抓取失败不影响其余页。
+- 标题优先使用目录中的标题（取自中站索引页），目录未收录时才使用条目页面标题；国际分部条目的目录标题可能是中文译名。
+- 折叠块、Tab 页等交互内容会被展开为普通文本，顺序可能与网页不同；正文图片和复杂 CSS 组件不会出现在渲染图里，表格按制表符分隔。
+- 图片高度随正文增长，默认每张 5000 字在 900px 宽下可能约 2500px 高，客户端会缩放显示。
+- 图片模式依赖宿主 `render.html2png`，渲染失败时回退文本模式。
+- 关闭联网抓取后，正文查询、随机和目录刷新均不可用，搜索也只能使用已有目录缓存。
+- DNS 校验以请求前的解析结果为准，无法固定 httpx 实际连接的 IP，极端 DNS 重绑定场景仍有时间窗口。
 
 ## 工程结构
 
 ```
 cateye_scp_article/
-├── _manifest.json    # Manifest v2（capabilities: send.text, send.forward, send.image, render.html2png, config.get）
-├── plugin.py         # 插件入口：配置模型、生命周期、分站路由、图片/文本双发送管线
-├── scp_core.py       # 纯逻辑层（不依赖 SDK，可离线单测）
-├── url_guard.py      # 出站 URL 统一安全护栏（scheme/host/IP 白黑名单 + 重定向逐跳复验）
-├── assets/           # 内置兜底页头资源（官方 logo + 已裁剪底纹的 data URI 快照）
+├── _manifest.json    # Manifest v2：版本、兼容区间、依赖与能力声明
+├── plugin.py         # 插件入口：配置模型、指令解析、目录与页头缓存、图片/文本发送管线
+├── scp_core.py       # 纯逻辑层：HTML 转文本、分页、目录解析与搜索、渲染 HTML、页头裁剪
+├── url_guard.py      # 出站 URL 校验与重定向逐跳复验
+├── admin_util.py     # 管理员 ID 合并与去重
+├── assets/           # 内置兜底页头快照
 │   ├── header_INT.json
 │   └── header_CN.json
 ├── tools/
-│   └── build_header_assets.py   # 开发期工具：重新抓取官方页头并生成上面的快照
+│   └── build_header_assets.py  # 开发期重新生成页头快照，运行时不导入
 ├── README.md         # 本文件
 ├── COMMANDS.md       # 指令速查
-├── NOTICE.md         # 第三方内容与分层许可声明（CC BY-SA 3.0 署名、修改说明）
-├── LICENSE           # 插件代码的 MIT 许可
-└── CHANGELOG.md      # 更新日志
+├── CHANGELOG.md      # 版本历史
+├── NOTICE.md         # 第三方内容署名与分层许可
+└── LICENSE           # MIT
 ```
 
-`scp_core.py` 承载全部可离线单测的核心逻辑：`strip_html` / `extract_page_content` /
-`chunk_by_paragraphs` / `build_forward_nodes` / `build_article_html` / `parse_catalog_items` /
-`search_catalog` / `slug_branch` / `force_branch_slug`。
+## 许可证与仓库
 
-## 数据来源与授权
-
-**本插件分层授权**（详见 [NOTICE.md](NOTICE.md)）：
-
-| 内容 | 许可 |
-|---|---|
-| `plugin.py` / `scp_core.py` / `tools/`（插件代码） | **MIT**（见 [LICENSE](LICENSE)，与 manifest 的 `license: "MIT"` 一致） |
-| `assets/header_*.json` 内的官方页头图片资源 | **CC BY-SA 3.0** |
-| 运行期抓取并展示的条目正文、页头资源 | **CC BY-SA 3.0** |
-
-- 条目正文与标题来自 **SCP 基金会**各分部维基（国际站 `scp-wiki.wikidot.com`、
-  中站 `scp-wiki-cn.wikidot.com`），依 **CC BY-SA 3.0** 授权：
-  - 国际站页头素材：来自 [国际站 Sigma 主题](https://scp-wiki.wikidot.com/component:theme)
-    （原 Sigma-9 主题设计：Aelanna），来源 `cdn.scpwiki.com/theme/en/sigma/images/`；
-  - 中站页头素材：来自 [SCP 基金会中文分部](https://scp-wiki-cn.wikidot.com) Sigma-9 主题，
-    来源 `sigma9.scpwikicn.com/cn/img/`（中站声明其版式与样式由 Aelanna 设计，适用 CC BY-SA 3.0）；
-  - **对素材的修改**：`body_bg` 由整页背景（100×400）裁剪为页头暗色带（100×164），
-    并以 base64 data URI 内嵌（CC BY-SA 要求标明修改）。
-- 本插件仅做**只读抓取与即时展示**，不缓存正文内容、不转载文章；
-  磁盘缓存中仅保存「编号 + 标题」目录与官方页头图片资源（用于渲染页头）。
-- 随插件发布的 `assets/header_INT.json` / `assets/header_CN.json` 是**同一批官方页头
-  图片资源**（logo + 已裁剪底纹）的 base64 内嵌副本，性质与运行时缓存一致，
-  仅用于在抓取失败时仍能渲染来源页头；可用 `tools/build_header_assets.py` 重新生成。
-  文件内已写入 `license` / `license_url` / `copyright` / `source_pages` / `changes` 字段。
-- 渲染图的页脚固定输出「内容来自 SCP 基金会维基，依 CC BY-SA 3.0 授权」，
-  并默认附带原页面链接，以满足维基的署名要求。
-- 本插件**不含** SCP-173 的旧配图（Izumi Kato 的 *Untitled 2004*，不在 CC 授权范围内、禁止商用）；
-  插件只抓取页面文本，不会获取或分发该图片。
-- 请遵守目标站点的访问频率与使用条款；插件已加超时与容错，不对同一页面做并发轰炸。
-
-> 为什么代码保持 MIT 而不整体改用 CC：知识共享官方不建议将 CC 协议用于软件
-> （缺少专利授权、Source/Binary 术语不适用于二进制），SCP 维基的
-> [授权指南](https://scp-wiki.wikidot.com/licensing-guide)亦给出同样建议
-> （并为软件提供 GPLv3 这一兼容选项）。
-
-## 已知限制
-
-- wikidot 的**全文搜索**依赖 JS，服务端不可直接调用；本插件改为「系列索引页目录 + 本地匹配」，
-  因此**搜索范围限于编号与标题**，不覆盖正文内容。
-- 条目若使用折叠块（collapsible）、Tab 页等交互元素，其隐藏内容会被展开为普通文本，
-  顺序可能与网页视觉略有差异；图片渲染为纯文本排版，不含原文图片与复杂 CSS 组件。
-- 国际分部的部分特殊条目（如 001 提案、多语言分部）标题可能为占位或英文。
-- 渲染图片高度随正文增长；极长段落分页后单张图片仍可能较高（约 2500px），
-  客户端会缩放显示，可点开查看原图。
+- 插件代码按 **MIT** 提供，见 [LICENSE](LICENSE)，与 `_manifest.json` 的 `license: "MIT"` 一致。
+- `assets/` 内的官方页头图片、运行期抓取的条目正文与页头资源按 **CC BY-SA 3.0** 使用；署名、修改说明与再分发要求见 [NOTICE.md](NOTICE.md)。
+- 仓库：<https://github.com/cateyemizuki/cateye_scp_article>
+- 问题反馈：<https://github.com/cateyemizuki/cateye_scp_article/issues>
+- 版本历史见 [CHANGELOG.md](CHANGELOG.md)，指令速查见 [COMMANDS.md](COMMANDS.md)。
